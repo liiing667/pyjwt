@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import warnings
 from calendar import timegm
@@ -18,6 +19,7 @@ from .exceptions import (
     InvalidIssuerError,
     InvalidJTIError,
     InvalidSubjectError,
+    InvalidTokenError,
     MissingRequiredClaimError,
 )
 from .warnings import RemovedInPyjwt3Warning
@@ -37,6 +39,21 @@ if TYPE_CHECKING or bool(os.getenv("SPHINX_BUILD", "")):
 
     AllowedPrivateKeyTypes: TypeAlias = Union[AllowedPrivateKeys, PyJWK, str, bytes]
     AllowedPublicKeyTypes: TypeAlias = Union[AllowedPublicKeys, PyJWK, str, bytes]
+
+
+def _reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that fails closed on duplicate JSON members.
+
+    Parsers disagree on which duplicate member wins, so a payload such as
+    ``{"exp": 1, "exp": 4102444800}`` could be valid in one service and
+    expired in another. Reject duplicates outright instead of picking one.
+    """
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DecodeError(f"Invalid payload string: duplicate member {key!r}")
+        result[key] = value
+    return result
 
 
 class PyJWT:
@@ -295,7 +312,9 @@ class PyJWT:
         payloads.
         """
         try:
-            payload: dict[str, Any] = json.loads(decoded["payload"])
+            payload: dict[str, Any] = json.loads(
+                decoded["payload"], object_pairs_hook=_reject_duplicate_members
+            )
         except (ValueError, RecursionError) as e:
             raise DecodeError(f"Invalid payload string: {e}") from e
         if not isinstance(payload, dict):
@@ -467,18 +486,46 @@ class PyJWT:
         if not isinstance(payload.get("jti"), str):
             raise InvalidJTIError("JWT ID must be a string")
 
+    @staticmethod
+    def _coerce_numeric_date(value: Any, error: InvalidTokenError) -> float:
+        """Return a NumericDate claim as a finite ``float``, failing closed.
+
+        ``bool`` is rejected even though it subclasses ``int``: ``true`` is
+        not a NumericDate and other services will not agree on its meaning.
+        Non-finite values (NaN, Infinity) and non-numeric types are rejected
+        as well. Numeric strings keep working for legacy tokens, and floats
+        are compared without truncation so sub-second boundaries behave the
+        same for every verifier.
+        """
+        if isinstance(value, bool):
+            raise error
+        if isinstance(value, (int, float)):
+            numeric = value
+        elif isinstance(value, str):
+            try:
+                numeric = float(value)
+            except ValueError:
+                raise error from None
+        else:
+            raise error
+        try:
+            result = float(numeric)
+        except OverflowError:
+            raise error from None
+        if not math.isfinite(result):
+            raise error
+        return result
+
     def _validate_iat(
         self,
         payload: dict[str, Any],
         now: float,
         leeway: float,
     ) -> None:
-        try:
-            iat = int(payload["iat"])
-        except (ValueError, TypeError, OverflowError):
-            raise InvalidIssuedAtError(
-                "Issued At claim (iat) must be an integer."
-            ) from None
+        iat = self._coerce_numeric_date(
+            payload["iat"],
+            InvalidIssuedAtError("Issued At claim (iat) must be an integer."),
+        )
         if iat > (now + leeway):
             raise ImmatureSignatureError("The token is not yet valid (iat)")
 
@@ -488,10 +535,10 @@ class PyJWT:
         now: float,
         leeway: float,
     ) -> None:
-        try:
-            nbf = int(payload["nbf"])
-        except (ValueError, TypeError, OverflowError):
-            raise DecodeError("Not Before claim (nbf) must be an integer.") from None
+        nbf = self._coerce_numeric_date(
+            payload["nbf"],
+            DecodeError("Not Before claim (nbf) must be an integer."),
+        )
 
         if nbf > (now + leeway):
             raise ImmatureSignatureError("The token is not yet valid (nbf)")
@@ -502,12 +549,10 @@ class PyJWT:
         now: float,
         leeway: float,
     ) -> None:
-        try:
-            exp = int(payload["exp"])
-        except (ValueError, TypeError, OverflowError):
-            raise DecodeError(
-                "Expiration Time claim (exp) must be an integer."
-            ) from None
+        exp = self._coerce_numeric_date(
+            payload["exp"],
+            DecodeError("Expiration Time claim (exp) must be an integer."),
+        )
 
         if exp <= (now - leeway):
             raise ExpiredSignatureError("Signature has expired")

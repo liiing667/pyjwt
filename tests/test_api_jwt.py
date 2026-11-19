@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 import json
 import time
 from calendar import timegm
@@ -26,7 +28,7 @@ from jwt.exceptions import (
     InvalidSubjectError,
     MissingRequiredClaimError,
 )
-from jwt.utils import base64url_decode
+from jwt.utils import base64url_decode, base64url_encode
 from jwt.warnings import RemovedInPyjwt3Warning
 
 from .utils import crypto_required, key_path, utc_timestamp
@@ -41,6 +43,26 @@ def jwt() -> PyJWT:
 def payload() -> dict[str, object]:
     """Creates a sample JWT claimset for use as a payload during tests"""
     return {"iss": "jeff", "exp": utc_timestamp() + 15, "claim": "insanity"}
+
+
+@pytest.fixture
+def fixed_clock(monkeypatch: pytest.MonkeyPatch) -> float:
+    """Freeze the validation clock at a fixed UTC instant.
+
+    Returns the fixed instant as a POSIX timestamp so tests can place
+    exp/nbf/iat exactly on, before, or after the boundary.
+    """
+    fixed = datetime(2030, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            if tz is None:
+                return fixed.replace(tzinfo=None)
+            return fixed.astimezone(tz)
+
+    monkeypatch.setattr("jwt.api_jwt.datetime", FixedDatetime)
+    return fixed.timestamp()
 
 
 class TestJWT:
@@ -369,7 +391,7 @@ class TestJWT:
             jwt.decode(example_jwt, "secret", algorithms=["HS256"])
 
     @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
-    @pytest.mark.parametrize("value", [[1], {"a": 1}, None, float("inf")])
+    @pytest.mark.parametrize("value", [[1], {"a": 1}, None, float("inf"), float("nan")])
     def test_decode_raises_clean_error_if_claim_is_non_numeric_type(
         self, jwt: PyJWT, claim: str, value: object
     ) -> None:
@@ -382,6 +404,107 @@ class TestJWT:
         with pytest.raises(expected) as exc:
             jwt.decode(jwt_message, secret, algorithms=["HS256"])
         assert claim in str(exc.value)
+
+    def test_decode_exp_float_boundary(self, jwt: PyJWT, fixed_clock: float) -> None:
+        secret = "secret"
+
+        token = jwt.encode({"exp": fixed_clock + 0.5}, secret)
+        data = jwt.decode(token, secret, algorithms=["HS256"])
+        assert data["exp"] == fixed_clock + 0.5
+
+        token = jwt.encode({"exp": fixed_clock - 0.5}, secret)
+        with pytest.raises(ExpiredSignatureError):
+            jwt.decode(token, secret, algorithms=["HS256"])
+
+    def test_decode_exp_exactly_now_is_rejected(
+        self, jwt: PyJWT, fixed_clock: float
+    ) -> None:
+        secret = "secret"
+        token = jwt.encode({"exp": fixed_clock}, secret)
+        with pytest.raises(ExpiredSignatureError):
+            jwt.decode(token, secret, algorithms=["HS256"])
+
+    def test_decode_exp_leeway_boundary(self, jwt: PyJWT, fixed_clock: float) -> None:
+        secret = "secret"
+        token = jwt.encode({"exp": fixed_clock - 10}, secret)
+
+        # exp == now - leeway is expired: the boundary fails closed
+        with pytest.raises(ExpiredSignatureError):
+            jwt.decode(token, secret, algorithms=["HS256"], leeway=10)
+
+        data = jwt.decode(token, secret, algorithms=["HS256"], leeway=10.5)
+        assert data["exp"] == fixed_clock - 10
+
+    def test_decode_nbf_float_boundary(self, jwt: PyJWT, fixed_clock: float) -> None:
+        secret = "secret"
+
+        token = jwt.encode({"nbf": fixed_clock}, secret)
+        data = jwt.decode(token, secret, algorithms=["HS256"])
+        assert data["nbf"] == fixed_clock
+
+        token = jwt.encode({"nbf": fixed_clock + 0.5}, secret)
+        with pytest.raises(ImmatureSignatureError):
+            jwt.decode(token, secret, algorithms=["HS256"])
+
+    def test_decode_iat_float_boundary(self, jwt: PyJWT, fixed_clock: float) -> None:
+        secret = "secret"
+
+        token = jwt.encode({"iat": fixed_clock}, secret)
+        data = jwt.decode(token, secret, algorithms=["HS256"])
+        assert data["iat"] == fixed_clock
+
+        token = jwt.encode({"iat": fixed_clock + 0.5}, secret)
+        with pytest.raises(ImmatureSignatureError):
+            jwt.decode(token, secret, algorithms=["HS256"])
+
+    @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+    @pytest.mark.parametrize("value", [True, False])
+    def test_decode_rejects_bool_numeric_date(
+        self, jwt: PyJWT, fixed_clock: float, claim: str, value: bool
+    ) -> None:
+        # bool subclasses int, but true/false is not a NumericDate and other
+        # verifiers will not agree on its meaning: reject it as a type error.
+        secret = "secret"
+        jwt_message = jwt.encode({claim: value}, secret)
+
+        expected = InvalidIssuedAtError if claim == "iat" else DecodeError
+        with pytest.raises(expected) as exc:
+            jwt.decode(jwt_message, secret, algorithms=["HS256"])
+        assert claim in str(exc.value)
+        assert not isinstance(
+            exc.value, (ExpiredSignatureError, ImmatureSignatureError)
+        )
+
+    def test_decode_rejects_duplicate_claim_members(
+        self, jwt: PyJWT, fixed_clock: float
+    ) -> None:
+        # An expired "exp" shadowed by a far-future duplicate must not become
+        # valid just because this parser keeps the last member.
+        secret = "secret"
+        header_segment = base64url_encode(b'{"alg":"HS256","typ":"JWT"}')
+        payload_segment = base64url_encode(b'{"exp": 1, "exp": 4102444800}')
+        signing_input = header_segment + b"." + payload_segment
+        signature = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+        token = signing_input + b"." + base64url_encode(signature)
+
+        with pytest.raises(DecodeError) as exc:
+            jwt.decode(token, secret, algorithms=["HS256"])
+        assert "duplicate" in str(exc.value)
+
+    def test_decode_legacy_integer_numeric_dates_still_valid(
+        self, jwt: PyJWT, fixed_clock: float
+    ) -> None:
+        secret = "secret"
+        legacy = {
+            "exp": int(fixed_clock) + 15,
+            "nbf": int(fixed_clock) - 15,
+            "iat": int(fixed_clock) - 15,
+        }
+        token = jwt.encode(legacy, secret)
+        data = jwt.decode(token, secret, algorithms=["HS256"])
+        assert data["exp"] == legacy["exp"]
+        assert data["nbf"] == legacy["nbf"]
+        assert data["iat"] == legacy["iat"]
 
     def test_decode_allows_aud_to_be_none(self, jwt: PyJWT) -> None:
         # >>> jwt.encode({'aud': None}, 'secret')

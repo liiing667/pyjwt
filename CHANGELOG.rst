@@ -10,6 +10,13 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 Changed
 ~~~~~~~
 
+- Make ``exp``/``nbf``/``iat`` validation fail closed and consistent across
+  services: ``bool`` and non-finite (NaN/Infinity) NumericDate claims are
+  rejected, float claims are compared against the validation clock without
+  truncation, and JSON payloads with duplicate members are rejected with
+  ``DecodeError``. Integer claims and numeric strings from legacy tokens
+  remain accepted.
+
 - Add public ``jwt.decode`` regression coverage for AWS ALB-style padded
   ES256 tokens, including rejection of tampered payloads and signatures,
   in `#1211 <https://github.com/jpadilla/pyjwt/pull/1211>`__.
