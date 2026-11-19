@@ -1,7 +1,8 @@
 import base64
 import binascii
+import json
 import re
-from typing import Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
 try:
     from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurve
@@ -144,3 +145,57 @@ _SSH_KEY_FORMATS = (
 
 def is_ssh_key(key: bytes) -> bool:
     return key.startswith(_SSH_KEY_FORMATS)
+
+
+# Bounds for the strict JSON object parsing used for JWT headers and claims.
+# They are deliberately generous so that any legitimate historical token
+# still parses, while blocking pathological documents (giant member counts,
+# deep nesting) and, critically, duplicate object keys that could be
+# interpreted differently by different parsers.
+DEFAULT_MAX_JSON_DEPTH = 32
+DEFAULT_MAX_JSON_MEMBERS = 256
+
+
+def json_loads_strict_object(
+    data: Union[str, bytes],
+    *,
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+    max_members: int = DEFAULT_MAX_JSON_MEMBERS,
+) -> Any:
+    """Parse JSON text with strict, fail-closed object semantics.
+
+    Unlike plain ``json.loads`` (which silently keeps the last value when an
+    object contains a duplicate key), this rejects duplicate keys, documents
+    nested deeper than ``max_depth`` and documents with more than
+    ``max_members`` total object members. All violations raise ``ValueError``
+    so callers can reject the token.
+    """
+    member_count = 0
+
+    def _object_pairs_hook(pairs: List[Tuple[str, Any]]) -> dict:
+        nonlocal member_count
+        member_count += len(pairs)
+        if member_count > max_members:
+            raise ValueError(f"JSON object member count exceeds limit of {max_members}")
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f"Duplicate JSON object key: {key!r}")
+            obj[key] = value
+        return obj
+
+    result = json.loads(data, object_pairs_hook=_object_pairs_hook)
+
+    # Enforce the depth limit iteratively so that deeply nested input cannot
+    # trigger unbounded recursion here. (Input nested beyond the json
+    # module's own recursion limit already failed in json.loads above.)
+    stack: List[Tuple[Any, int]] = [(result, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if isinstance(value, (dict, list)):
+            if depth > max_depth:
+                raise ValueError(f"JSON nesting depth exceeds limit of {max_depth}")
+            children = value.values() if isinstance(value, dict) else value
+            stack.extend((child, depth + 1) for child in children)
+
+    return result

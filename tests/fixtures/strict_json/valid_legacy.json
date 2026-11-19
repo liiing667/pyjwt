@@ -1,0 +1,46 @@
+{
+  "address": {
+    "geo": {
+      "lat": 31.2,
+      "lng": 121.5
+    },
+    "street": "1 Main St"
+  },
+  "admin": false,
+  "aud": [
+    "service-a",
+    "service-b"
+  ],
+  "custom": {
+    "nested": {
+      "flag": true,
+      "list": [
+        1,
+        2,
+        {
+          "three": 3
+        }
+      ],
+      "nil": null
+    }
+  },
+  "exp": 1893456000,
+  "groups": [
+    "eng",
+    "sec",
+    "ops"
+  ],
+  "iat": 1732000000,
+  "iss": "https://issuer.example.com",
+  "jti": "token-id-1",
+  "name": "Jane Doe",
+  "nbf": 1732000000,
+  "realm_access": {
+    "roles": [
+      "user",
+      "auditor"
+    ]
+  },
+  "scope": "read write",
+  "sub": "user-123"
+}

@@ -20,7 +20,7 @@ from .exceptions import (
     InvalidSignatureError,
     InvalidTokenError,
 )
-from .utils import base64url_decode, base64url_encode
+from .utils import base64url_decode, base64url_encode, json_loads_strict_object
 from .warnings import InsecureKeyLengthWarning, RemovedInPyjwt3Warning
 
 if TYPE_CHECKING:
@@ -369,7 +369,7 @@ class PyJWS:
         header_data = self._decode_base64url_segment(header_segment, "header")
 
         try:
-            header: dict[str, Any] = json.loads(header_data)
+            header: dict[str, Any] = json_loads_strict_object(header_data)
         except (ValueError, RecursionError) as e:
             raise DecodeError(f"Invalid header string: {e}") from e
 

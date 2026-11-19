@@ -20,6 +20,7 @@ from .exceptions import (
     InvalidSubjectError,
     MissingRequiredClaimError,
 )
+from .utils import json_loads_strict_object
 from .warnings import RemovedInPyjwt3Warning
 
 if TYPE_CHECKING or bool(os.getenv("SPHINX_BUILD", "")):
@@ -295,7 +296,7 @@ class PyJWT:
         payloads.
         """
         try:
-            payload: dict[str, Any] = json.loads(decoded["payload"])
+            payload: dict[str, Any] = json_loads_strict_object(decoded["payload"])
         except (ValueError, RecursionError) as e:
             raise DecodeError(f"Invalid payload string: {e}") from e
         if not isinstance(payload, dict):
