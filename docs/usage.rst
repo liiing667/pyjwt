@@ -514,6 +514,19 @@ If the ``kid`` is not found in the current key set, ``PyJWKClient``
 automatically refreshes the JWKS from the endpoint and retries before raising
 an error.
 
+Key rotation and the signing-key cache
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When ``cache_keys=True``, individual signing keys are cached by ``kid`` in an
+LRU cache. Those cached keys are bound to the generation of the JWK Set they
+were resolved from: every successful JWKS refresh advances the generation and
+invalidates the key cache, so when an identity provider rotates a key while
+reusing its ``kid`` the next lookup returns the new public key instead of the
+revoked one. A failed refresh does not replace the JWK Set, so the previous
+generation and its cached keys remain available as the last verifiable state;
+repeated requests within a generation are still served entirely from the
+cache.
+
 ``PyJWKClient`` also includes built-in caching to avoid unnecessary network
 requests. See :class:`~jwt.PyJWKClient` in the API reference for details on
 the caching parameters.

@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "alg": "RS256",
+      "kty": "RSA",
+      "use": "sig",
+      "kid": "rotating-key",
+      "n": "yL5PMiKjQK1SBtqyA3ppHOksf2nZML2YgVIl-CvbJBmLI9LYSxxJv8Kq5webD-lHVXbq7zjDt4gPBxJilsE5upggqJostCV6jAgbiL9zFHdhF_LQ4y7nkYJhH2HJNf_M8fz21s9OY6eG0IW_8hJz3D5FYKcEyGEb6GaierftvWxGRURKH5p2XnxCifmVGR2qIydvlS2s-VJxGq1W3hyqJhvO16ALcweMj0q83-DPTbwcxp6c3buiS-8FGtGPx8demK1ys9jB29C_ldp08TF0q4qWp1bdhVPLEPNxO2yXoVZwlqXe6mdsiOUKk1AnioSVpIXlR6DrqeRJHiy8EA0LCw",
+      "e": "AQAB"
+    }
+  ]
+}

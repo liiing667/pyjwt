@@ -70,7 +70,12 @@ class PyJWKClient:
         **Tier 2 — Signing key cache** (disabled by default):
         Caches individual signing keys (looked up by ``kid``) using an LRU
         cache with **no time-based expiration**. Keys are evicted only when
-        the cache reaches its maximum size. Controlled by:
+        the cache reaches its maximum size. Each cached key is bound to the
+        JWK Set generation (Tier 1) it was resolved from: after a
+        successful JWK Set refresh replaces the key material, the key cache
+        is invalidated so a same-``kid`` rotation cannot keep serving the
+        revoked public key. A failed refresh leaves the previous generation
+        and its cached keys in place. Controlled by:
 
         - ``cache_keys``: Set to ``True`` to enable this cache.
           Defaults to ``False``.
@@ -126,6 +131,15 @@ class PyJWKClient:
         self.cooldown_duration = cooldown_duration
         self._last_successful_fetch: float | None = None
         self._client_lock = threading.RLock()
+        self._cache_keys = cache_keys
+        # JWK Set generation the current signing-key cache entries belong to.
+        # `None` means no signing key has been resolved yet.
+        self._key_cache_generation: int | None = None
+        # Generation served from the LRU after an expired JWK Set failed to
+        # refresh. The stale entries remain the last verifiable state, and
+        # repeat lookups keep serving them instead of retrying the endpoint
+        # on every call. Cleared as soon as a refresh succeeds.
+        self._stale_key_cache_generation: int | None = None
 
         if cache_jwk_set:
             # Init jwt set cache with default or given lifespan.
@@ -138,11 +152,13 @@ class PyJWKClient:
         else:
             self.jwk_set_cache = None
 
-        if cache_keys:
-            # Cache signing keys
-            get_signing_key = lru_cache(maxsize=max_cached_keys)(self.get_signing_key)
-            # Ignore mypy (https://github.com/python/mypy/issues/2427)
-            self.get_signing_key = get_signing_key  # type: ignore[method-assign]
+        if self._cache_keys:
+            # Cache signing keys. The LRU wraps the uncached lookup while the
+            # public `get_signing_key` wrapper below binds the cached entries
+            # to the JWK Set generation, invalidating them on rotation.
+            self._get_signing_key = lru_cache(maxsize=max_cached_keys)(  # type: ignore[method-assign]
+                self._get_signing_key
+            )
 
     def fetch_data(self) -> Any:
         """Fetch the JWK Set from the JWKS endpoint.
@@ -263,6 +279,93 @@ class PyJWKClient:
     def get_signing_key(self, kid: str) -> PyJWK:
         """Return the signing key matching the given ``kid``.
 
+        When ``cache_keys`` is enabled, repeated calls for the same ``kid``
+        are served from the LRU cache as long as the JWK Set generation it
+        was resolved from is still current. A successful JWK Set refresh
+        (including a same-``kid`` rotation) advances the generation and
+        invalidates stale key entries; a failed refresh preserves the
+        previous, still-verifiable generation.
+        """
+        if not self._cache_keys:
+            return self._get_signing_key(kid)
+
+        with self._client_lock:
+            cache_state = self._key_cache_state()
+            if cache_state == "current":
+                return self._get_signing_key(kid)
+
+            if cache_state == "stale_generation":
+                # The JWK Set was replaced (by this client or a subclass's
+                # own refresh) after the LRU entries were resolved. Drop the
+                # old-generation entries and resolve against the set already
+                # in the cache, without another network round-trip.
+                self._get_signing_key.cache_clear()  # type: ignore[attr-defined]
+                self._key_cache_generation = None
+                self._stale_key_cache_generation = None
+                return self._get_signing_key(kid)
+
+            # The bound JWK Set is empty or expired. Attempt a refresh
+            # *before* touching the LRU: when it succeeds the new
+            # generation invalidates stale entries, and when it fails the
+            # previously cached keys remain available as the last
+            # verifiable state.
+            previous_generation = self._key_cache_generation
+            try:
+                self.get_jwk_set(refresh=True)
+            except PyJWKClientError:
+                if previous_generation is None:
+                    raise
+                self._key_cache_generation = previous_generation
+                self._stale_key_cache_generation = previous_generation
+                return self._get_signing_key(kid)
+
+            self._stale_key_cache_generation = None
+            jwk_set_cache = self.jwk_set_cache
+            assert jwk_set_cache is not None
+            if (
+                self._key_cache_generation is None
+                or self._key_cache_generation != jwk_set_cache.generation
+            ):
+                self._get_signing_key.cache_clear()  # type: ignore[attr-defined]
+                self._key_cache_generation = None
+
+            return self._get_signing_key(kid)
+
+    def _key_cache_state(self) -> str:
+        """Classify the signing-key cache relative to the JWK Set."""
+        if self.jwk_set_cache is None:
+            # Without a JWK Set cache there is no generation to bind to;
+            # keep the historical LRU behavior.
+            return "current"
+
+        if self._key_cache_generation is None:
+            if self.jwk_set_cache.get() is None:
+                return "needs_refresh"
+            # A JWK Set is already cached (e.g. fetched directly) but no key
+            # has been resolved from it yet.
+            return "stale_generation"
+
+        if self._key_cache_generation != self.jwk_set_cache.generation:
+            return "stale_generation"
+
+        # An expired JWK Set must be re-fetched before serving another key,
+        # otherwise a same-`kid` rotation would stay hidden for the whole
+        # (unbounded) LRU lifetime.
+        if self.jwk_set_cache.is_expired():
+            if (
+                self._stale_key_cache_generation is not None
+                and self._stale_key_cache_generation == self._key_cache_generation
+            ):
+                # A refresh already failed: keep serving the retained,
+                # last-verifiable generation without another fetch.
+                return "current"
+            return "needs_refresh"
+
+        return "current"
+
+    def _get_signing_key(self, kid: str) -> PyJWK:
+        """Return the signing key matching the given ``kid``.
+
         If no match is found in the current JWK Set, the set is refreshed
         from the endpoint and the lookup is retried once when the refresh
         cooldown permits it.
@@ -295,6 +398,9 @@ class PyJWKClient:
                         f'Unable to find a signing key that matches: "{kid}"'
                     )
 
+            if self.jwk_set_cache is not None:
+                # Bind this resolved key to the generation currently cached.
+                self._key_cache_generation = self.jwk_set_cache.generation
             return signing_key
 
     def get_signing_key_from_jwt(self, token: str | bytes) -> PyJWK:

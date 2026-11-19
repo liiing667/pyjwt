@@ -7,6 +7,16 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 `Unreleased <https://github.com/jpadilla/pyjwt/compare/2.15.1...HEAD>`__
 -------------------------------------------------------------------------
 
+Security
+~~~~~~~~
+
+- Bind the per-key signing cache (``cache_keys=True``) to the cached JWK
+  Set generation. A successful JWKS refresh now invalidates cached signing
+  keys, including when a rotated key reuses an existing ``kid``, so a
+  revoked public key can no longer keep verifying replayed tokens. Failed
+  refreshes retain the previous, still-verifiable JWK Set and key cache,
+  and repeated lookups continue to be served from the cache.
+
 Changed
 ~~~~~~~
 

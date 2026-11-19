@@ -9,6 +9,13 @@ class JWKSetCache:
     def __init__(self, lifespan: float) -> None:
         self.jwk_set_with_timestamp: Optional[PyJWTSetWithTimestamp] = None
         self.lifespan = lifespan
+        # Monotonic generation of the cached JWK Set. It advances on every
+        # successful replacement (and on explicit clears), so per-key caches
+        # can tell whether the key material they hold still belongs to the
+        # JWK Set currently in effect. A same-`kid` rotation therefore
+        # invalidates a previously cached signing key instead of silently
+        # keeping the revoked public key reachable.
+        self.generation: int = 0
 
     def put(self, jwk_set: Optional[Union[PyJWKSet, dict[str, Any]]]) -> None:
         """Cache *jwk_set*, or clear the cache when it is ``None``.
@@ -23,6 +30,7 @@ class JWKSetCache:
         if jwk_set is None:
             # clear cache
             self.jwk_set_with_timestamp = None
+            self.generation += 1
             return
 
         if not isinstance(jwk_set, PyJWKSet):
@@ -30,7 +38,10 @@ class JWKSetCache:
                 raise PyJWKSetError("Invalid JWK Set value")
             jwk_set = PyJWKSet.from_dict(jwk_set)
 
+        # A failed parse raises before this point, so the previous JWK Set
+        # and its generation stay untouched on refresh failures.
         self.jwk_set_with_timestamp = PyJWTSetWithTimestamp(jwk_set)
+        self.generation += 1
 
     def get(self) -> Optional[PyJWKSet]:
         if self.jwk_set_with_timestamp is None or self.is_expired():
