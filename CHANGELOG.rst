@@ -7,6 +7,19 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 `Unreleased <https://github.com/jpadilla/pyjwt/compare/2.15.1...HEAD>`__
 -------------------------------------------------------------------------
 
+Added
+~~~~~
+
+- ``PyJWK`` now binds an ``x5c`` certificate chain to a single verifiable
+  public key identity. When ``x5c`` is present, the chain must parse and link
+  cryptographically, the leaf certificate's public key must match the inline
+  JWK key members (``n``/``e`` or ``x``/``y``), ``x5t``/``x5t#S256``
+  thumbprints must match the leaf certificate, and a ``sig``/``enc`` ``use``
+  value must be permitted by the leaf's key usage extension. Mismatched
+  certificate material, thumbprints, key usage or algorithm/key-type
+  conflicts fail closed with ``InvalidKeyError``. Valid single chains and
+  multi-algorithm JWK Set rotation continue to load.
+
 Changed
 ~~~~~~~
 

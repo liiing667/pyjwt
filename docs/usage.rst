@@ -486,11 +486,17 @@ Pass the JWKS URL to create a client, then call
 ``get_signing_key_from_jwt()`` with a token to look up the matching key by its
 ``kid`` header claim:
 
-For RSA JWKs, ``PyJWK`` and ``PyJWKClient`` construct the verification key from
-the ``n`` and ``e`` members. They do not validate the certificate-related
-``x5c``, ``x5t``, or ``x5t#S256`` members. If your application trusts or pins a
-certificate, verify that its public key matches the key used for JWT signature
-verification; do not infer that relationship from those JWK members alone.
+For RSA and EC JWKs, ``PyJWK`` and ``PyJWKClient`` construct the verification
+key from the inline key members (``n``/``e`` or ``x``/``y``). When an ``x5c``
+certificate chain is present, it is bound to that single key identity before
+the JWK is accepted: every certificate must parse as DER and form a linked,
+cryptographically valid chain, the leaf certificate's public key must match
+the inline key members, any ``x5t``/``x5t#S256`` thumbprints must match the
+leaf certificate, and a ``sig``/``enc`` ``use`` value must be permitted by the
+leaf's key usage extension. A mismatch fails closed with
+:class:`jwt.exceptions.InvalidKeyError` rather than authenticating the wrong
+identity. The opaque ``kid`` member is only checked when the JWK itself asserts
+that it equals one of the thumbprint members.
 
 .. code-block:: pycon
 

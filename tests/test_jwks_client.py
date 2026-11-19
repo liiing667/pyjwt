@@ -246,6 +246,10 @@ class TestPyJWKClient:
 
         mocked_key = RESPONSE_DATA_WITH_MATCHING_KID["keys"][0].copy()
         mocked_key["use"] = "enc"
+        # A JWK advertising key encipherment must not point at a certificate
+        # whose key usage only permits digital signatures; drop the x5c chain
+        # here so the use-based filter, not certificate binding, is exercised.
+        mocked_key.pop("x5c", None)
         response = {"keys": [mocked_key]}
         with mocked_success_response(response):
             jwks_client = PyJWKClient(url)

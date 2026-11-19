@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from .algorithms import get_default_algorithms, has_crypto, requires_cryptography
+from .cert_chain import validate_jwk_certificate_binding
 from .exceptions import (
     InvalidKeyError,
     MissingCryptographyError,
@@ -85,6 +86,12 @@ class PyJWK:
             raise InvalidKeyError(
                 f"Unable to construct key from JWK: {error}"
             ) from error
+
+        # An x5c chain is an independently supplied assertion of the key's
+        # identity. Bind it (and any thumbprints/usage metadata) to the key
+        # built from the inline JWK parameters so mismatched material fails
+        # closed instead of silently authenticating the wrong identity.
+        validate_jwk_certificate_binding(self._jwk_data, self.key)
 
     @staticmethod
     def from_dict(obj: JWKDict, algorithm: str | None = None) -> PyJWK:
