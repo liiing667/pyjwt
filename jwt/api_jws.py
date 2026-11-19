@@ -271,8 +271,15 @@ class PyJWS:
                 raise DecodeError(
                     'It is required that you pass in a value for the "detached_payload" argument to decode a message having the b64 header set to false.'
                 )
-            payload = detached_payload
-            signing_input = b".".join([signing_input.rsplit(b".", 1)[0], payload])
+            # Pin the detached payload to an immutable bytes object before it
+            # becomes both the signing input and the returned payload.
+            # Accepting a mutable buffer (e.g. bytearray) would let the caller
+            # change the authenticated content after signature verification,
+            # while non-bytes input such as str previously escaped as a raw
+            # TypeError from the join below instead of a library DecodeError.
+            payload = self._coerce_detached_payload(detached_payload)
+            header_segment = signing_input.rsplit(b".", 1)[0]
+            signing_input = b".".join([header_segment, payload])
 
         if verify_signature:
             self._verify_signature(
@@ -322,6 +329,26 @@ class PyJWS:
         self._validate_headers(headers)
 
         return headers
+
+    @staticmethod
+    def _coerce_detached_payload(detached_payload: Any) -> bytes:
+        """Bind the caller-supplied detached payload to an immutable value.
+
+        The same object is used to build the RFC 7797 (b64=false) signing
+        input and returned as the authenticated payload, so it must be
+        immutable bytes: a bytearray could be rewritten after verification
+        to make the returned content differ from what was signed, and a
+        non-bytes value (e.g. str) would fail deep inside the join with a
+        raw TypeError rather than a library-level DecodeError.
+        """
+        if isinstance(detached_payload, bytes):
+            return detached_payload
+        if isinstance(detached_payload, bytearray):
+            return bytes(detached_payload)
+        raise DecodeError(
+            "The 'detached_payload' argument must be bytes when the protected "
+            'header has "b64" set to false.'
+        )
 
     @staticmethod
     def _decode_base64url_segment(segment: bytes, name: str) -> bytes:

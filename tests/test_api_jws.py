@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 from decimal import Decimal
 
@@ -1315,4 +1317,142 @@ class TestJWS:
         with pytest.raises(jwt.InvalidKeyError, match="must not be empty"):
             jwt.PyJWK.from_dict(
                 {"kty": "oct", "k": "", "kid": "active", "alg": "HS256"}
+            )
+
+
+class TestDetachedPayloadBinding:
+    """RFC 7797 (b64=false) detached payloads must bind identity and failure.
+
+    The caller-supplied payload is not carried in the compact token, so it
+    must be pinned to an immutable value before it feeds both the signing
+    input and the returned payload, and every length/content mismatch must
+    surface as a signature failure rather than reading some other content.
+    """
+
+    # Fixed fixture, generated with HMAC-SHA256 over the exact signing input
+    # shown below (header segment + "." + raw, unencoded payload).
+    secret = "secret"
+    header_b64 = (
+        "eyJhbGciOiJIUzI1NiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il0sInR5cCI6IkpXVCJ9"
+    )
+    payload = b'{"sub":"detached-subject","event":"security-review"}'
+    signing_input = (
+        "eyJhbGciOiJIUzI1NiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il0sInR5cCI6IkpXVCJ9"
+        '.{"sub":"detached-subject","event":"security-review"}'
+    )
+    signature_b64 = "8EB9VRmqyMAlfNOepNxmvK5pxvMEph22dzhwKZBWqN8"
+    token = (
+        "eyJhbGciOiJIUzI1NiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il0sInR5cCI6IkpXVCJ9"
+        "..8EB9VRmqyMAlfNOepNxmvK5pxvMEph22dzhwKZBWqN8"
+    )
+
+    # Signature over the same protected header joined with a different-length
+    # payload; it must never validate against the fixture token or payload.
+    other_payload = b'{"sub":"other-subject"}'
+    other_signature_b64 = "Sdt76fu-pLSKuvMdyi_qUGkEdqGs0RA7esBRQpPJlSk"
+
+    @pytest.fixture
+    def jws(self) -> PyJWS:
+        return PyJWS()
+
+    def test_fixture_signing_input_matches_token(self, jws: PyJWS) -> None:
+        # The signature is only meaningful for this exact header.payload
+        # signing input; assert the fixture documents it.
+        assert self.token == f"{self.header_b64}..{self.signature_b64}"
+        expected_sig = hmac.new(
+            self.secret.encode(), self.signing_input.encode(), hashlib.sha256
+        ).digest()
+        assert base64url_encode(expected_sig).decode() == self.signature_b64
+
+        header = json.loads(base64url_decode(self.header_b64.encode()))
+        assert header["alg"] == "HS256"
+        assert header["b64"] is False
+        assert header["crit"] == ["b64"]
+
+    def test_valid_detached_token_round_trips(self, jws: PyJWS) -> None:
+        decoded = jws.decode_complete(
+            self.token,
+            self.secret,
+            algorithms=["HS256"],
+            detached_payload=self.payload,
+        )
+
+        assert decoded["payload"] == self.payload
+        assert decoded["header"]["b64"] is False
+        assert decoded["header"]["crit"] == ["b64"]
+        assert base64url_encode(decoded["signature"]).decode() == self.signature_b64
+
+    def test_returned_payload_is_immutable_identity(self, jws: PyJWS) -> None:
+        decoded = jws.decode(
+            self.token,
+            self.secret,
+            algorithms=["HS256"],
+            detached_payload=self.payload,
+        )
+
+        # The authenticated content is returned as the same immutable bytes
+        # object the caller passed, so it cannot drift after verification.
+        assert decoded is self.payload
+        assert isinstance(decoded, bytes)
+
+    def test_mutable_buffer_is_frozen_before_verification(self, jws: PyJWS) -> None:
+        mutable_payload = bytearray(self.payload)
+
+        decoded = jws.decode(
+            self.token,
+            self.secret,
+            algorithms=["HS256"],
+            detached_payload=mutable_payload,
+        )
+
+        assert decoded == self.payload
+        assert isinstance(decoded, bytes)
+        assert not isinstance(decoded, bytearray)
+
+        # Mutating the caller's buffer after the call must not change what
+        # was authenticated and returned.
+        mutable_payload[:] = b'{"sub":"attacker","event":"admin"}'
+        assert decoded == self.payload
+
+    def test_non_bytes_detached_payload_is_decode_error(self, jws: PyJWS) -> None:
+        with pytest.raises(DecodeError, match="detached_payload.*bytes"):
+            jws.decode(
+                self.token,
+                self.secret,
+                algorithms=["HS256"],
+                detached_payload=self.payload.decode(),
+            )
+
+    def test_wrong_length_detached_payload_is_rejected(self, jws: PyJWS) -> None:
+        # The token's signature does not cover this different-length payload,
+        # so verification must fail instead of returning the new content.
+        with pytest.raises(InvalidSignatureError):
+            jws.decode(
+                self.token,
+                self.secret,
+                algorithms=["HS256"],
+                detached_payload=self.other_payload,
+            )
+
+    def test_signature_over_other_payload_does_not_validate(self, jws: PyJWS) -> None:
+        # A token whose signature was produced over another payload with the
+        # same protected header must be rejected against the original
+        # payload: header identity alone is not enough to accept it.
+        other_token = f"{self.header_b64}..{self.other_signature_b64}"
+        with pytest.raises(InvalidSignatureError):
+            jws.decode(
+                other_token,
+                self.secret,
+                algorithms=["HS256"],
+                detached_payload=self.payload,
+            )
+
+        # And the fixture token must not validate against that other payload
+        # even though its signature was computed over it.
+        with pytest.raises(InvalidSignatureError):
+            jws.decode(
+                self.token,
+                self.secret,
+                algorithms=["HS256"],
+                detached_payload=self.other_payload,
             )
