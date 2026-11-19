@@ -7,12 +7,14 @@ from typing import Any
 
 from .algorithms import get_default_algorithms, has_crypto, requires_cryptography
 from .exceptions import (
+    InvalidAlgorithmError,
     InvalidKeyError,
     MissingCryptographyError,
     PyJWKError,
     PyJWKSetError,
     PyJWTError,
 )
+from .jwk_certs import validate_key_use, verify_certificate_binding
 from .types import JWKDict
 
 
@@ -34,8 +36,14 @@ class PyJWK:
         if not kty:
             raise InvalidKeyError(f"kty is not found: {self._jwk_data}")
 
-        if not algorithm and isinstance(self._jwk_data, dict):
-            algorithm = self._jwk_data.get("alg", None)
+        declared_algorithm = self._jwk_data.get("alg", None)
+        if not algorithm:
+            algorithm = declared_algorithm
+        elif declared_algorithm and algorithm != declared_algorithm:
+            raise InvalidAlgorithmError(
+                f"Algorithm {algorithm!r} conflicts with the JWK's alg "
+                f"member {declared_algorithm!r}"
+            )
 
         if not algorithm:
             # Determine alg with kty (and crv).
@@ -85,6 +93,29 @@ class PyJWK:
             raise InvalidKeyError(
                 f"Unable to construct key from JWK: {error}"
             ) from error
+
+        # Bind all certificate-related members (x5c, x5t, x5t#S256) to the
+        # single public-key identity already constructed above, and make sure
+        # the declared key use is compatible with that identity. Any
+        # inconsistency fails closed rather than being trusted blindly.
+        self.certificates = verify_certificate_binding(
+            self._jwk_data, self._public_part(self.key)
+        )
+        validate_key_use(
+            self._jwk_data,
+            self.certificates[0] if self.certificates else None,
+            self.algorithm_name,
+        )
+
+    @staticmethod
+    def _public_part(key: Any) -> Any:
+        public_method = getattr(key, "public_key", None)
+        return public_method() if callable(public_method) else key
+
+    @property
+    def certificate(self) -> Any:
+        """The leaf certificate from a validated ``x5c`` chain, or ``None``."""
+        return self.certificates[0] if self.certificates else None
 
     @staticmethod
     def from_dict(obj: JWKDict, algorithm: str | None = None) -> PyJWK:

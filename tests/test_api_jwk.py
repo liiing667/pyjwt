@@ -222,6 +222,16 @@ class TestPyJWK:
         with pytest.raises(MissingCryptographyError):
             PyJWK({"kty": "dummy"}, algorithm="RS256")
 
+    @crypto_required
+    def test_jwk_without_certificate_members_exposes_empty_chain(self) -> None:
+        with open(key_path("jwk_rsa_pub.json")) as keyfile:
+            key_data = json.loads(keyfile.read())
+
+        jwk = PyJWK.from_dict(key_data)
+
+        assert jwk.certificates == []
+        assert jwk.certificate is None
+
 
 class TestPyJWKSet:
     @crypto_required

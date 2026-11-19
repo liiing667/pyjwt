@@ -10,6 +10,17 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 Changed
 ~~~~~~~
 
+- ``PyJWK`` now binds the certificate-related JWK members (``x5c``,
+  ``x5t`` and ``x5t#S256``), the ``use`` member and an explicit algorithm
+  to the single public-key identity represented by the JWK's key members.
+  The ``x5c`` chain must be contiguous and internally signed, its leaf
+  certificate must carry the JWK's public key, any thumbprints must match
+  that leaf, ``use`` must be compatible with the algorithm and the leaf
+  certificate's key usage, and an explicit algorithm may not conflict with
+  the JWK's ``alg``. Mismatches fail closed with the new
+  ``jwt.InvalidCertificateError`` (a subclass of ``InvalidKeyError``) or
+  ``jwt.InvalidAlgorithmError``; JWKs without certificate members are
+  unaffected.
 - Add public ``jwt.decode`` regression coverage for AWS ALB-style padded
   ES256 tokens, including rejection of tampered payloads and signatures,
   in `#1211 <https://github.com/jpadilla/pyjwt/pull/1211>`__.

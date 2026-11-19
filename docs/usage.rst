@@ -487,10 +487,28 @@ Pass the JWKS URL to create a client, then call
 ``kid`` header claim:
 
 For RSA JWKs, ``PyJWK`` and ``PyJWKClient`` construct the verification key from
-the ``n`` and ``e`` members. They do not validate the certificate-related
-``x5c``, ``x5t``, or ``x5t#S256`` members. If your application trusts or pins a
-certificate, verify that its public key matches the key used for JWT signature
-verification; do not infer that relationship from those JWK members alone.
+the ``n`` and ``e`` members. When a JWK also carries certificate-related
+members (``x5c``, ``x5t`` or ``x5t#S256``), ``PyJWK`` binds them to the same
+verifiable public-key identity instead of trusting them as independent
+metadata:
+
+- the leaf certificate in ``x5c`` must carry the same public key as the JWK's
+  other key members;
+- the ``x5c`` chain must be contiguous (each certificate issued by the next)
+  and every certificate signature must verify;
+- any ``x5t`` (SHA-1) or ``x5t#S256`` (SHA-256) member must be the thumbprint
+  of that leaf certificate;
+- the ``use`` member must be compatible with the key, and when the leaf
+  certificate has a key usage extension it must permit that use;
+- an algorithm passed explicitly must not conflict with the JWK's ``alg``.
+
+Any mismatch raises :class:`jwt.InvalidCertificateError` (a subclass of
+:class:`jwt.InvalidKeyError`) or :class:`jwt.InvalidAlgorithmError`, so a
+confused or tampered JWK fails closed rather than verifying signatures with a
+key whose certificate identity does not match. A JWK without certificate
+members behaves exactly as before, and a legitimate single chain -- including
+several algorithms (for example ``RS256`` and ``ES256``) rotating under one
+identity -- continues to load and verify normally.
 
 .. code-block:: pycon
 

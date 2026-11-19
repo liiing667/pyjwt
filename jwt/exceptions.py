@@ -62,6 +62,15 @@ class InvalidKeyError(PyJWTError):
     pass
 
 
+class InvalidCertificateError(InvalidKeyError):
+    """Raised when the certificate material embedded in a JWK (``x5c``,
+    ``x5t`` or ``x5t#S256``) cannot be parsed, does not form a single
+    verifiable chain, or does not bind the same public-key identity as the
+    other JWK members."""
+
+    pass
+
+
 class InvalidAlgorithmError(InvalidTokenError):
     """Raised when the specified algorithm is not recognized by PyJWT"""
 
