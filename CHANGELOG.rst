@@ -14,6 +14,19 @@ Changed
   ES256 tokens, including rejection of tampered payloads and signatures,
   in `#1211 <https://github.com/jpadilla/pyjwt/pull/1211>`__.
 
+Fixed
+~~~~~
+
+- Harden the ``exp``/``nbf``/``iat`` NumericDate checks so the same token
+  reaches the same verdict on every service. Fractional-second claims are now
+  compared at full precision instead of being truncated toward zero by
+  ``int()``; booleans and non-finite floats (``NaN``/infinity) are rejected
+  fail-closed; numeric strings stay accepted for backwards compatibility;
+  payload JSON objects containing duplicate member names are rejected with
+  ``DecodeError`` instead of silently keeping the last value. All three
+  claims are validated against a single verification clock read once per
+  ``decode()`` call.
+
 `v2.15.1 <https://github.com/jpadilla/pyjwt/compare/2.15.0...2.15.1>`__
 -----------------------------------------------------------------------
 

@@ -184,6 +184,25 @@ datetime, which will be converted into an int. For example:
     >>> token = jwt.encode({"exp": 1371720939}, "secret")
     >>> token = jwt.encode({"exp": datetime.now(tz=timezone.utc)}, "secret")
 
+The same validation rules apply to the ``exp``, ``nbf`` and ``iat``
+NumericDate claims and are intentionally fail-closed so that every service
+reaches the same verdict for the same token:
+
+- Integers and floats are accepted, including fractional seconds; the value
+  is compared at full precision rather than being truncated to an integer.
+- Booleans (``true``/``false``) and non-finite numbers (``NaN``/infinity)
+  are rejected even though Python treats ``bool`` as a subtype of ``int``.
+- Numeric strings are still accepted for backwards compatibility with tokens
+  already in circulation; any other type raises
+  ``jwt.InvalidIssuedAtError`` for ``iat`` or ``jwt.DecodeError`` for
+  ``exp``/``nbf``.
+- A payload whose JSON object repeats a member name (for example two ``exp``
+  entries) is rejected with ``jwt.DecodeError`` instead of silently keeping
+  the last value.
+- The boundary is strict: a token whose ``exp`` equals the current time is
+  considered expired, while ``nbf``/``iat`` equal to the current time are
+  accepted. ``leeway`` widens the window by the given number of seconds.
+
 Expiration time is automatically verified in `jwt.decode()` and raises
 `jwt.ExpiredSignatureError` if the expiration time is in the past:
 

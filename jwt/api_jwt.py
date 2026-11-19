@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import warnings
 from calendar import timegm
@@ -37,6 +38,75 @@ if TYPE_CHECKING or bool(os.getenv("SPHINX_BUILD", "")):
 
     AllowedPrivateKeyTypes: TypeAlias = Union[AllowedPrivateKeys, PyJWK, str, bytes]
     AllowedPublicKeyTypes: TypeAlias = Union[AllowedPublicKeys, PyJWK, str, bytes]
+
+
+def _utc_now() -> float:
+    """Single source of the verification clock (POSIX seconds, UTC).
+
+    All time claims (``exp``/``nbf``/``iat``) are checked against one value
+    read per ``decode()`` call, so a token can never be judged against two
+    different clocks within the same verification.
+    """
+    return datetime.now(tz=timezone.utc).timestamp()
+
+
+class _DuplicateJSONKeyError(ValueError):
+    """Raised when a JSON object contains a repeated member name."""
+
+
+def _reject_duplicate_members(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJSONKeyError(
+                f"Duplicate JSON object member: {key!r}"
+            )
+        result[key] = value
+    return result
+
+
+def _coerce_numeric_date(value: Any, claim: str) -> float:
+    """Coerce an ``exp``/``nbf``/``iat`` claim to a POSIX timestamp.
+
+    RFC 7519 defines NumericDate as a JSON number (integer or fractional
+    seconds). The rules here are intentionally fail-closed and identical for
+    every time claim, so the same token reaches the same verdict on every
+    service instead of depending on silent type coercion:
+
+    * ``bool`` is rejected even though it is an ``int`` subclass.
+    * ``int`` and ``float`` are accepted; fractional seconds are preserved
+      rather than truncated toward zero.
+    * Non-finite floats (``NaN``/infinity) are rejected because they make
+      every boundary comparison meaningless.
+    * Numeric strings remain accepted for backwards compatibility with tokens
+      already in circulation.
+    * Anything else (``None``, list, dict, ...) is rejected.
+    """
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{claim} must be a numeric value, not a boolean"
+        )
+
+    if isinstance(value, int):
+        return float(value)
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{claim} must be a finite numeric value")
+        return value
+
+    if isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError:
+            raise ValueError(f"{claim} must be an integer.") from None
+        if not math.isfinite(parsed):
+            raise ValueError(f"{claim} must be a finite numeric value")
+        return parsed
+
+    raise ValueError(f"{claim} must be an integer.")
 
 
 class PyJWT:
@@ -295,7 +365,10 @@ class PyJWT:
         payloads.
         """
         try:
-            payload: dict[str, Any] = json.loads(decoded["payload"])
+            payload: dict[str, Any] = json.loads(
+                decoded["payload"],
+                object_pairs_hook=_reject_duplicate_members,
+            )
         except (ValueError, RecursionError) as e:
             raise DecodeError(f"Invalid payload string: {e}") from e
         if not isinstance(payload, dict):
@@ -398,7 +471,7 @@ class PyJWT:
 
         self._validate_required_claims(payload, options["require"])
 
-        now = datetime.now(tz=timezone.utc).timestamp()
+        now = _utc_now()
 
         if "iat" in payload and options["verify_iat"]:
             self._validate_iat(payload, now, leeway)
@@ -474,7 +547,7 @@ class PyJWT:
         leeway: float,
     ) -> None:
         try:
-            iat = int(payload["iat"])
+            iat = _coerce_numeric_date(payload["iat"], "Issued At claim (iat)")
         except (ValueError, TypeError, OverflowError):
             raise InvalidIssuedAtError(
                 "Issued At claim (iat) must be an integer."
@@ -489,7 +562,7 @@ class PyJWT:
         leeway: float,
     ) -> None:
         try:
-            nbf = int(payload["nbf"])
+            nbf = _coerce_numeric_date(payload["nbf"], "Not Before claim (nbf)")
         except (ValueError, TypeError, OverflowError):
             raise DecodeError("Not Before claim (nbf) must be an integer.") from None
 
@@ -503,7 +576,7 @@ class PyJWT:
         leeway: float,
     ) -> None:
         try:
-            exp = int(payload["exp"])
+            exp = _coerce_numeric_date(payload["exp"], "Expiration Time claim (exp)")
         except (ValueError, TypeError, OverflowError):
             raise DecodeError(
                 "Expiration Time claim (exp) must be an integer."

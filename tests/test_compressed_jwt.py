@@ -2,13 +2,15 @@ import json
 import zlib
 
 from jwt import PyJWT
+from jwt.api_jwt import _reject_duplicate_members
 
 
 class CompressedPyJWT(PyJWT):
     def _decode_payload(self, decoded: dict[str, bytes]) -> dict[str, object]:
         payload = json.loads(
             # wbits=-15 has zlib not worry about headers of crc's
-            zlib.decompress(decoded["payload"], wbits=-15).decode("utf-8")
+            zlib.decompress(decoded["payload"], wbits=-15).decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_members,
         )
         assert isinstance(payload, dict)
         return payload
