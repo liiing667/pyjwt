@@ -1,5 +1,6 @@
 import json
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -1308,6 +1309,202 @@ class TestJWS:
 
         with pytest.raises(InvalidTokenError, match="Unsupported critical extension"):
             jws.get_unverified_header(token)
+
+    # ------------------------------------------------------------------
+    # Fail-closed rules for RFC 7797 detached payloads (b64=false).
+    # Every malformed fixture below is built by hand so the test pins the
+    # exact byte-level ambiguity two JOSE processors could disagree on, and
+    # pairs each rejection with the canonical, accepted form.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sign_detached_fixture(
+        header_obj: dict[str, Any],
+        payload: bytes,
+        secret: str,
+        middle_segment: bytes = b"",
+    ) -> str:
+        import hashlib
+        import hmac
+
+        header_b64 = base64url_encode(
+            json.dumps(header_obj, separators=(",", ":")).encode()
+        )
+        signing_input = b".".join([header_b64, payload])
+        signature = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+        return b".".join(
+            [header_b64, middle_segment, base64url_encode(signature)]
+        ).decode()
+
+    @pytest.mark.parametrize("bad_b64", ["false", 0, 1, None, "true"])
+    def test_decode_rejects_non_boolean_b64(
+        self, jws: PyJWS, payload: bytes, bad_b64: Any
+    ) -> None:
+        # A non-boolean "b64" (string, number, null) makes a strict parser
+        # treat the payload as base64url while PyJWT's identity check would
+        # treat it as detached. The header must be rejected instead.
+        secret = "secret"
+        token = self._sign_detached_fixture(
+            {"alg": "HS256", "b64": bad_b64, "crit": ["b64"]},
+            payload,
+            secret,
+        )
+
+        with pytest.raises(InvalidTokenError, match="'b64'.*JSON boolean"):
+            jws.decode(
+                token,
+                secret,
+                algorithms=["HS256"],
+                detached_payload=payload,
+            )
+
+    def test_boolean_b64_fixture_still_verifies(
+        self, jws: PyJWS, payload: bytes
+    ) -> None:
+        # Canonical companion of test_decode_rejects_non_boolean_b64:
+        # the same fixture with a real JSON boolean must verify.
+        secret = "secret"
+        token = self._sign_detached_fixture(
+            {"alg": "HS256", "b64": False, "crit": ["b64"]},
+            payload,
+            secret,
+        )
+
+        assert (
+            jws.decode(
+                token,
+                secret,
+                algorithms=["HS256"],
+                detached_payload=payload,
+            )
+            == payload
+        )
+
+    def test_encode_rejects_non_boolean_b64(self, jws: PyJWS, payload: bytes) -> None:
+        secret = "secret"
+        with pytest.raises(InvalidTokenError, match="'b64'.*JSON boolean"):
+            jws.encode(
+                payload,
+                secret,
+                algorithm="HS256",
+                headers={"b64": "false"},  # type: ignore[dict-item]
+            )
+
+    def test_decode_rejects_duplicate_crit_entries(
+        self, jws: PyJWS, payload: bytes
+    ) -> None:
+        # RFC 7515 §4.1.11 forbids duplicate names in "crit"; duplicated
+        # "b64" entries let processors key off different occurrences.
+        secret = "secret"
+        token = self._sign_detached_fixture(
+            {"alg": "HS256", "b64": False, "crit": ["b64", "b64"]},
+            payload,
+            secret,
+        )
+
+        with pytest.raises(InvalidTokenError, match="duplicate header parameter"):
+            jws.decode(
+                token,
+                secret,
+                algorithms=["HS256"],
+                detached_payload=payload,
+            )
+
+    def test_decode_rejects_standard_parameter_in_crit(
+        self, jws: PyJWS, payload: bytes
+    ) -> None:
+        # RFC 7515 §4.1.11: "crit" names extension parameters only. Standard
+        # names already have defined semantics, so listing one makes
+        # compliant implementations diverge.
+        import hashlib
+        import hmac
+
+        secret = "secret"
+        header_obj = {"typ": "JWT", "alg": "HS256", "crit": ["alg"]}
+        header_b64 = base64url_encode(
+            json.dumps(header_obj, separators=(",", ":")).encode()
+        )
+        payload_b64 = base64url_encode(payload)
+        signature = hmac.new(
+            secret.encode(),
+            b".".join([header_b64, payload_b64]),
+            hashlib.sha256,
+        ).digest()
+        token = b".".join(
+            [header_b64, payload_b64, base64url_encode(signature)]
+        ).decode()
+
+        with pytest.raises(InvalidTokenError, match="standard header parameter"):
+            jws.decode(token, secret, algorithms=["HS256"])
+
+    def test_decode_rejects_duplicate_json_header_members(
+        self, jws: PyJWS, payload: bytes
+    ) -> None:
+        # RFC 8725 §4.0.5: duplicate JOSE header members are ambiguous —
+        # Python keeps the last value, other stacks keep the first, so they
+        # disagree on whether the payload is detached.
+        import hashlib
+        import hmac
+
+        secret = "secret"
+        raw_header = ('{"alg":"HS256","b64":false,"b64":true,"crit":["b64"]}').encode()
+        header_b64 = base64url_encode(raw_header)
+        payload_b64 = base64url_encode(payload)
+        signature = hmac.new(
+            secret.encode(),
+            b".".join([header_b64, payload_b64]),
+            hashlib.sha256,
+        ).digest()
+        token = b".".join(
+            [header_b64, payload_b64, base64url_encode(signature)]
+        ).decode()
+
+        with pytest.raises(DecodeError, match="duplicate header parameter"):
+            jws.get_unverified_header(token)
+
+    def test_decode_rejects_non_bytes_detached_payload(
+        self, jws: PyJWS, payload: bytes
+    ) -> None:
+        # The detached payload is joined straight into the signing input;
+        # a str would be implicitly UTF-8 encoded, so the type is pinned.
+        secret = "secret"
+        token = jws.encode(payload, secret, algorithm="HS256", is_payload_detached=True)
+
+        with pytest.raises(DecodeError, match="detached_payload.*bytes"):
+            jws.decode(
+                token,
+                secret,
+                algorithms=["HS256"],
+                detached_payload=payload.decode(),  # type: ignore[arg-type]
+            )
+
+    def test_detached_signature_input_is_bound_to_supplied_payload(
+        self, jws: PyJWS, payload: bytes
+    ) -> None:
+        # Canonical detached token verifies with its own payload; swapping
+        # even one byte must fail signature verification, proving the HMAC
+        # covers the caller-supplied bytes rather than the empty token slot.
+        secret = "secret"
+        token = jws.encode(payload, secret, algorithm="HS256", is_payload_detached=True)
+
+        assert (
+            jws.decode(
+                token,
+                secret,
+                algorithms=["HS256"],
+                detached_payload=payload,
+            )
+            == payload
+        )
+
+        tampered = payload[:-1] + bytes([payload[-1] ^ 0x01])
+        with pytest.raises(InvalidSignatureError):
+            jws.decode(
+                token,
+                secret,
+                algorithms=["HS256"],
+                detached_payload=tampered,
+            )
 
     def test_pyjwk_rejects_empty_hmac_key(self) -> None:
         import jwt

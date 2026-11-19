@@ -31,6 +31,42 @@ _ALGORITHM_UNSET = object()
 _BASE64URL_ALPHABET = (
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
+# Header parameter names registered in RFC 7515 §4.1, plus the RFC 7797
+# "b64" extension. Per RFC 7515 §4.1.11, "crit" lists extension header
+# parameters only; standard names must never appear in it.
+_STANDARD_HEADER_PARAMETERS = frozenset(
+    {
+        "alg",
+        "jku",
+        "jwk",
+        "kid",
+        "x5u",
+        "x5c",
+        "x5t",
+        "x5t#S256",
+        "typ",
+        "cty",
+        "crit",
+        "b64",
+    }
+)
+
+
+def _reject_duplicate_header_members(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    # JSON objects with duplicate member names are ambiguous: Python keeps
+    # the last value while other JOSE processors may keep the first, so two
+    # verifiers can disagree on "b64"/"crit" and hence on which payload the
+    # signature covers. RFC 8725 §4.0.5 requires rejecting such headers.
+    header: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in header:
+            raise DecodeError(
+                f"Invalid header string: duplicate header parameter {name!r}"
+            )
+        header[name] = value
+    return header
 
 
 class PyJWS:
@@ -148,6 +184,8 @@ class PyJWS:
 
         # Prefer headers values if present to function parameters.
         if headers:
+            self._validate_headers(headers, encoding=True)
+
             headers_alg = headers.get("alg")
             if headers_alg:
                 algorithm_ = headers["alg"]
@@ -160,7 +198,6 @@ class PyJWS:
         header: dict[str, Any] = {"typ": self.header_typ, "alg": algorithm_}
 
         if headers:
-            self._validate_headers(headers, encoding=True)
             header.update(headers)
 
         if not header["typ"]:
@@ -172,10 +209,18 @@ class PyJWS:
             # "b64" appears in the protected header, so b64-unaware
             # verifiers don't silently treat an unencoded payload as
             # base64-encoded.
-            existing_crit = header.get("crit", [])
-            if not isinstance(existing_crit, list):
-                raise InvalidTokenError("Invalid 'crit' header: must be a list")
-            if "b64" not in existing_crit:
+            existing_crit = header.get("crit")
+            if existing_crit is None:
+                header["crit"] = ["b64"]
+            else:
+                # A non-list "crit" cannot be extended safely; deeper
+                # semantic/uniqueness validation stays on the decode path so
+                # producers can still forward headers they do not implement.
+                if not isinstance(existing_crit, list):
+                    raise InvalidTokenError(
+                        "Invalid 'crit' header: must be a non-empty list"
+                    )
+            if existing_crit is not None and "b64" not in existing_crit:
                 header["crit"] = [*existing_crit, "b64"]
         elif "b64" in header:
             # True is the standard value for b64, so no need for it
@@ -253,12 +298,25 @@ class PyJWS:
 
         self._validate_headers(header)
 
-        if detached_payload is not None and header.get("b64", True) is not False:
+        b64_value = header.get("b64", True)
+        if "b64" in header and not isinstance(b64_value, bool):
+            # RFC 7797 §3: "b64" must be a JSON boolean. Values such as
+            # "false", 0 or null let different processors pick different
+            # payloads (detached vs. base64url), so reject rather than guess.
+            raise InvalidTokenError("The 'b64' header parameter must be a JSON boolean")
+
+        if detached_payload is not None and not isinstance(detached_payload, bytes):
+            # The detached payload is concatenated into the signing input.
+            # A str (or any non-bytes value) would be implicitly encoded by
+            # the join below, so pin the type explicitly and fail closed.
+            raise DecodeError('"detached_payload" must be bytes')
+
+        if detached_payload is not None and b64_value is not False:
             raise DecodeError(
                 'It is only valid to pass "detached_payload" when the protected header has "b64" set to false.'
             )
 
-        if header.get("b64", True) is False:
+        if b64_value is False:
             # RFC 7797 §3: when "b64" is present in the protected header,
             # it MUST also appear in "crit". A token that sets b64=false
             # without declaring it critical is malformed.
@@ -271,6 +329,9 @@ class PyJWS:
                 raise DecodeError(
                     'It is required that you pass in a value for the "detached_payload" argument to decode a message having the b64 header set to false.'
                 )
+            # Bind the caller-supplied payload to the exact bytes covered by
+            # the signature. _load already guaranteed the compact-form middle
+            # segment is empty, so no token-borne bytes participate here.
             payload = detached_payload
             signing_input = b".".join([signing_input.rsplit(b".", 1)[0], payload])
 
@@ -369,7 +430,9 @@ class PyJWS:
         header_data = self._decode_base64url_segment(header_segment, "header")
 
         try:
-            header: dict[str, Any] = json.loads(header_data)
+            header: dict[str, Any] = json.loads(
+                header_data, object_pairs_hook=_reject_duplicate_header_members
+            )
         except (ValueError, RecursionError) as e:
             raise DecodeError(f"Invalid header string: {e}") from e
 
@@ -453,26 +516,65 @@ class PyJWS:
     ) -> None:
         if "kid" in headers:
             self._validate_kid(headers["kid"])
-        if not encoding and "crit" in headers:
+        if "b64" in headers and not isinstance(headers["b64"], bool):
+            # Same fail-closed rule as the decode path: the b64 type decides
+            # whether the payload is detached, and non-boolean JSON values
+            # are interpreted differently across JOSE implementations.
+            raise InvalidTokenError("The 'b64' header parameter must be a JSON boolean")
+        if "crit" in headers and not encoding:
             self._validate_crit(headers)
 
     def _validate_kid(self, kid: Any) -> None:
         if not isinstance(kid, str):
             raise InvalidTokenError("Key ID header parameter must be a string")
 
-    def _validate_crit(self, headers: dict[str, Any]) -> None:
-        crit = headers["crit"]
-        if not isinstance(crit, list) or len(crit) == 0:
+    def _validate_crit_shape(self, crit: Any) -> None:
+        if not isinstance(crit, list):
             raise InvalidTokenError("Invalid 'crit' header: must be a non-empty list")
         for ext in crit:
             if not isinstance(ext, str):
                 raise InvalidTokenError("Invalid 'crit' header: values must be strings")
+        # RFC 7515 §4.1.11: the "crit" list MUST NOT contain duplicate header
+        # parameter names. A duplicated entry lets processors diverge on which
+        # occurrence governs processing of the payload.
+        if len(set(crit)) != len(crit):
+            raise InvalidTokenError(
+                "Invalid 'crit' header: duplicate header parameter names are not allowed"
+            )
+
+    def _validate_crit_structure(self, crit: Any) -> None:
+        self._validate_crit_shape(crit)
+        if len(crit) == 0:
+            raise InvalidTokenError("Invalid 'crit' header: must be a non-empty list")
+
+    def _validate_crit(self, headers: dict[str, Any]) -> None:
+        crit = headers["crit"]
+        # Runs on the decode/get_unverified_header path only. Every rule
+        # here is fail-closed: shape (list of unique strings), no standard
+        # parameter names, every extension must be implemented and present,
+        # and "b64" in crit requires an actual b64=false header.
+        self._validate_crit_structure(crit)
+        for ext in crit:
+            if ext in _STANDARD_HEADER_PARAMETERS and ext != "b64":
+                # RFC 7515 §4.1.11: "crit" names extension header parameters;
+                # standard parameters have defined semantics already, and
+                # listing them makes compliant implementations disagree.
+                raise InvalidTokenError(
+                    f"Invalid 'crit' header: standard header parameter {ext!r} must not be listed as critical"
+                )
             if ext not in self._supported_crit:
                 raise InvalidTokenError(f"Unsupported critical extension: {ext}")
             if ext not in headers:
                 raise InvalidTokenError(
                     f"Critical extension '{ext}' is missing from headers"
                 )
+            if ext == "b64":
+                # RFC 7797 §3 explicitly registers "b64" as the one
+                # extension that may (and must) appear in "crit".
+                if headers.get("b64") is not False:
+                    raise InvalidTokenError(
+                        "The 'b64' header parameter requires 'b64' to be listed in 'crit'."
+                    )
 
 
 _jws_global_obj = PyJWS()
