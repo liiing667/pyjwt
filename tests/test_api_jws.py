@@ -1165,6 +1165,131 @@ class TestJWS:
             in str(exc.value)
         )
 
+    # Fixed RFC 7797 detached token: every byte of the protected header,
+    # signing input and signature is pinned so the tests below assert the
+    # exact bytes that were authenticated, rather than recomputing them.
+    _detached_secret = b"0123456789abcdef0123456789abcdef"
+    _detached_payload = b'{"sub":"alice","role":"user"}'
+    _detached_header_b64 = (
+        "eyJhbGciOiJIUzI1NiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il0sInR5cCI6IkpXVCJ9"
+    )
+    _detached_signing_input = (
+        "eyJhbGciOiJIUzI1NiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il0sInR5cCI6IkpXVCJ9"
+        '.{"sub":"alice","role":"user"}'
+    )
+    _detached_token = (
+        "eyJhbGciOiJIUzI1NiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il0sInR5cCI6IkpXVCJ9"
+        "..gAB2zdFlVwj02E4GQi81m1wb84MJNwKJikxNOdge22I"
+    )
+
+    def test_decode_detached_fixed_fixture_roundtrip(self, jws: PyJWS) -> None:
+        # The fixed token must verify against the exact signing input
+        # (protected header || '.' || raw payload) pinned above.
+        import hmac as _hmac
+        import hashlib as _hashlib
+
+        header_b64 = self._detached_token.split(".")[0].encode()
+        expected_signing_input = b".".join([header_b64, self._detached_payload])
+        assert expected_signing_input == self._detached_signing_input.encode()
+
+        expected_sig = _hmac.new(
+            self._detached_secret,
+            expected_signing_input,
+            _hashlib.sha256,
+        ).digest()
+        assert (
+            base64url_encode(expected_sig).decode()
+            == self._detached_token.split(".")[2]
+        )
+
+        decoded = jws.decode_complete(
+            self._detached_token,
+            self._detached_secret,
+            algorithms=["HS256"],
+            detached_payload=self._detached_payload,
+        )
+        assert decoded["payload"] == self._detached_payload
+        assert decoded["header"]["b64"] is False
+        assert decoded["header"]["crit"] == ["b64"]
+
+    def test_decode_detached_fixed_fixture_wrong_length_is_rejected(
+        self, jws: PyJWS
+    ) -> None:
+        # A truncated buffer changes the length and content of the signing
+        # input, so the pinned signature must fail rather than silently
+        # authenticating a different payload.
+        truncated = self._detached_payload[:10]
+        signing_input = b".".join([self._detached_header_b64.encode(), truncated])
+        assert signing_input != self._detached_signing_input.encode()
+
+        with pytest.raises(
+            InvalidSignatureError, match="Signature verification failed"
+        ):
+            jws.decode_complete(
+                self._detached_token,
+                self._detached_secret,
+                algorithms=["HS256"],
+                detached_payload=truncated,
+            )
+
+    def test_decode_detached_fixed_fixture_tampered_content_is_rejected(
+        self, jws: PyJWS
+    ) -> None:
+        # Same length, different bytes: the signature covers the raw
+        # payload, so any in-place tampering is rejected.
+        tampered = b'{"sub":"alice","role":"useX"}'
+        assert len(tampered) == len(self._detached_payload)
+
+        with pytest.raises(InvalidSignatureError):
+            jws.decode(
+                self._detached_token,
+                self._detached_secret,
+                algorithms=["HS256"],
+                detached_payload=tampered,
+            )
+
+    def test_decode_detached_payload_is_immutable_snapshot(self, jws: PyJWS) -> None:
+        # A caller-owned bytearray/memoryview may be reused by another
+        # request after decode() returns. The returned payload must be an
+        # independent bytes snapshot of exactly what was signed, so buffer
+        # reuse cannot change the content the application treats as
+        # verified.
+        caller_buffer = bytearray(self._detached_payload)
+        decoded = jws.decode_complete(
+            self._detached_token,
+            self._detached_secret,
+            algorithms=["HS256"],
+            detached_payload=caller_buffer,
+        )
+
+        assert isinstance(decoded["payload"], bytes)
+        assert decoded["payload"] == self._detached_payload
+        assert decoded["payload"] is not caller_buffer
+
+        caller_buffer[:] = b'{"sub":"attacker","role":"admin"}'
+        assert decoded["payload"] == self._detached_payload
+
+    def test_decode_detached_memoryview_is_snapshotted(self, jws: PyJWS) -> None:
+        view = memoryview(bytearray(self._detached_payload))
+        decoded = jws.decode_complete(
+            self._detached_token,
+            self._detached_secret,
+            algorithms=["HS256"],
+            detached_payload=view,
+        )
+
+        assert type(decoded["payload"]) is bytes
+        assert decoded["payload"] == self._detached_payload
+
+    def test_decode_detached_rejects_non_bytes_like_payload(self, jws: PyJWS) -> None:
+        with pytest.raises(DecodeError, match="bytes-like object"):
+            jws.decode(
+                self._detached_token,
+                self._detached_secret,
+                algorithms=["HS256"],
+                detached_payload="not a bytes payload",  # type: ignore[arg-type]
+            )
+
     def test_decode_warns_on_unsupported_kwarg(
         self, jws: PyJWS, payload: bytes
     ) -> None:

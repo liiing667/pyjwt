@@ -271,7 +271,18 @@ class PyJWS:
                 raise DecodeError(
                     'It is required that you pass in a value for the "detached_payload" argument to decode a message having the b64 header set to false.'
                 )
-            payload = detached_payload
+            if not isinstance(detached_payload, (bytes, bytearray, memoryview)):
+                raise DecodeError('"detached_payload" must be a bytes-like object')
+
+            # Bind the payload identity to this verification call. The
+            # caller-supplied buffer may be a bytearray or memoryview whose
+            # storage is reused or resized by another request before the
+            # application consumes the result; without a snapshot the
+            # returned payload could alias bytes that were never signed.
+            # The same immutable object feeds both the signing input and
+            # the result, so verification success and returned content
+            # cannot diverge.
+            payload = bytes(detached_payload)
             signing_input = b".".join([signing_input.rsplit(b".", 1)[0], payload])
 
         if verify_signature:
