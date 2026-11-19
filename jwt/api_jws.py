@@ -31,6 +31,12 @@ _ALGORITHM_UNSET = object()
 _BASE64URL_ALPHABET = (
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
+# A JOSE protected header carries only small identity parameters
+# ("alg", "kid", "typ", ...). Cap both the encoded segment and the
+# "kid" it contains so key selection can never be forced to decode or
+# retain attacker-controlled megabytes before a key is even chosen.
+_MAX_PROTECTED_HEADER_LENGTH = 8192
+_MAX_KID_LENGTH = 1024
 
 
 class PyJWS:
@@ -318,10 +324,62 @@ class PyJWS:
         Note: The signature is not verified so the header parameters
         should not be fully trusted until signature verification is complete
         """
-        headers = self._load(jwt)[2]
+        headers = self._read_protected_header(jwt)
         self._validate_headers(headers)
 
         return headers
+
+    def _read_protected_header(self, jwt: str | bytes) -> dict[str, Any]:
+        """Parse only the protected header segment of a compact JWS.
+
+        Key selection only needs the identity advertised in the protected
+        header (notably ``alg`` and ``kid``). The payload and signature
+        segments are never touched here, so an oversized or malformed
+        payload cannot inflate the cost of choosing a key. Payload
+        validation is deferred to full verification.
+        """
+        if isinstance(jwt, str):
+            jwt = jwt.encode("utf-8")
+
+        if not isinstance(jwt, bytes):
+            raise DecodeError(f"Invalid token type. Token must be a {bytes}")
+
+        header_segment, separator, _ = jwt.partition(b".")
+        if not separator or not header_segment:
+            raise DecodeError("Not enough segments")
+
+        if len(header_segment) > _MAX_PROTECTED_HEADER_LENGTH:
+            raise DecodeError(
+                "Invalid header: protected header exceeds the maximum size of "
+                f"{_MAX_PROTECTED_HEADER_LENGTH} bytes"
+            )
+
+        header_data = self._decode_base64url_segment(header_segment, "header")
+        return self._parse_header(header_data)
+
+    @staticmethod
+    def _reject_duplicate_header_key(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        header: dict[str, Any] = {}
+        for name, value in pairs:
+            if name in header:
+                raise DecodeError(
+                    f"Invalid header string: duplicate header parameter {name!r}"
+                )
+            header[name] = value
+        return header
+
+    def _parse_header(self, header_data: bytes) -> dict[str, Any]:
+        try:
+            header: dict[str, Any] = json.loads(
+                header_data, object_pairs_hook=self._reject_duplicate_header_key
+            )
+        except (ValueError, RecursionError) as e:
+            raise DecodeError(f"Invalid header string: {e}") from e
+
+        if not isinstance(header, dict):
+            raise DecodeError("Invalid header string: must be a json object")
+
+        return header
 
     @staticmethod
     def _decode_base64url_segment(segment: bytes, name: str) -> bytes:
@@ -366,15 +424,14 @@ class PyJWS:
         except ValueError as err:
             raise DecodeError("Not enough segments") from err
 
+        if len(header_segment) > _MAX_PROTECTED_HEADER_LENGTH:
+            raise DecodeError(
+                "Invalid header: protected header exceeds the maximum size of "
+                f"{_MAX_PROTECTED_HEADER_LENGTH} bytes"
+            )
+
         header_data = self._decode_base64url_segment(header_segment, "header")
-
-        try:
-            header: dict[str, Any] = json.loads(header_data)
-        except (ValueError, RecursionError) as e:
-            raise DecodeError(f"Invalid header string: {e}") from e
-
-        if not isinstance(header, dict):
-            raise DecodeError("Invalid header string: must be a json object")
+        header = self._parse_header(header_data)
 
         if header.get("b64", True) is False:
             # Detached payload form (RFC 7515 Appendix F): the compact-form
@@ -459,6 +516,10 @@ class PyJWS:
     def _validate_kid(self, kid: Any) -> None:
         if not isinstance(kid, str):
             raise InvalidTokenError("Key ID header parameter must be a string")
+        if len(kid) > _MAX_KID_LENGTH:
+            raise InvalidTokenError(
+                f"Key ID header parameter must not exceed {_MAX_KID_LENGTH} characters"
+            )
 
     def _validate_crit(self, headers: dict[str, Any]) -> None:
         crit = headers["crit"]

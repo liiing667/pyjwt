@@ -13,7 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 
 from .api_jwk import PyJWK, PyJWKSet
-from .api_jwt import decode_complete as decode_token
+from .api_jws import get_unverified_header
 from .exceptions import PyJWKClientConnectionError, PyJWKClientError
 from .jwk_set_cache import JWKSetCache
 
@@ -260,7 +260,7 @@ class PyJWKClient:
 
         return signing_keys
 
-    def get_signing_key(self, kid: str) -> PyJWK:
+    def get_signing_key(self, kid: str | None) -> PyJWK:
         """Return the signing key matching the given ``kid``.
 
         If no match is found in the current JWK Set, the set is refreshed
@@ -268,7 +268,7 @@ class PyJWKClient:
         cooldown permits it.
 
         :param kid: The key ID to look up.
-        :type kid: str
+        :type kid: str or None
         :returns: The matching signing key.
         :rtype: PyJWK
         :raises PyJWKClientError: If no matching key is found after
@@ -300,26 +300,29 @@ class PyJWKClient:
     def get_signing_key_from_jwt(self, token: str | bytes) -> PyJWK:
         """Return the signing key for a JWT by reading its ``kid`` header.
 
-        Extracts the ``kid`` from the token's unverified header and
-        delegates to :meth:`get_signing_key`.
+        Extracts the ``kid`` from the token's unverified, strictly
+        validated protected header and delegates to
+        :meth:`get_signing_key`. Only the bounded header segment is read:
+        the payload and signature are not parsed here, so a malformed or
+        oversized payload cannot amplify key-selection cost. Payload and
+        signature errors surface later, during full verification.
 
         :param token: The encoded JWT.
         :type token: str or bytes
         :returns: The matching signing key.
         :rtype: PyJWK
         """
-        unverified = decode_token(token, options={"verify_signature": False})
-        header = unverified["header"]
+        header = get_unverified_header(token)
         return self.get_signing_key(header.get("kid"))
 
     @staticmethod
-    def match_kid(signing_keys: list[PyJWK], kid: str) -> PyJWK | None:
+    def match_kid(signing_keys: list[PyJWK], kid: str | None) -> PyJWK | None:
         """Find a key in *signing_keys* that matches *kid*.
 
         :param signing_keys: The list of keys to search.
         :type signing_keys: list[PyJWK]
         :param kid: The key ID to match.
-        :type kid: str
+        :type kid: str or None
         :returns: The matching key, or ``None`` if not found.
         :rtype: PyJWK or None
         """

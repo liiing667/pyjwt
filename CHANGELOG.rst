@@ -7,6 +7,17 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 `Unreleased <https://github.com/jpadilla/pyjwt/compare/2.15.1...HEAD>`__
 -------------------------------------------------------------------------
 
+Security
+~~~~~~~~
+
+- ``PyJWKClient.get_signing_key_from_jwt()`` now resolves the signing key
+  from a strictly validated, size-capped protected header instead of
+  decoding the complete token. Oversized or malformed payloads can no
+  longer amplify key-selection cost; payload and signature errors are
+  deferred to full verification. Protected headers above 8 KiB, ``kid``
+  values longer than 1024 characters, and duplicated header parameters
+  fail closed.
+
 Changed
 ~~~~~~~
 

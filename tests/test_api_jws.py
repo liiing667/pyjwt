@@ -781,6 +781,49 @@ class TestJWS:
 
         assert "Key ID header parameter must be a string" == str(exc.value)
 
+    def test_get_unverified_header_ignores_corrupt_payload(self, jws: PyJWS) -> None:
+        header_segment = base64url_encode(
+            json.dumps({"alg": "HS256", "kid": "abc"}).encode()
+        )
+        # The payload segment is not valid base64url; header inspection must
+        # not attempt to decode it.
+        token = b".".join([header_segment, b"not valid base64!!!", b"c2ln"]).decode()
+
+        header = jws.get_unverified_header(token)
+        assert header == {"alg": "HS256", "kid": "abc"}
+
+    def test_get_unverified_header_rejects_oversized_header(self, jws: PyJWS) -> None:
+        oversized_header = base64url_encode(b"a" * 9000)
+        token = b".".join([oversized_header, b"e30", b"c2ln"]).decode()
+
+        with pytest.raises(DecodeError, match="maximum size"):
+            jws.get_unverified_header(token)
+
+    def test_get_unverified_header_rejects_oversized_kid(self, jws: PyJWS) -> None:
+        header_segment = base64url_encode(
+            json.dumps({"alg": "HS256", "kid": "k" * 1025}).encode()
+        )
+        token = b".".join([header_segment, b"e30", b"c2ln"]).decode()
+
+        with pytest.raises(InvalidTokenError, match="Key ID header parameter"):
+            jws.get_unverified_header(token)
+
+    def test_get_unverified_header_rejects_duplicate_header_parameter(
+        self, jws: PyJWS
+    ) -> None:
+        raw_header = b'{"alg":"HS256","kid":"first","kid":"second"}'
+        header_segment = base64url_encode(raw_header)
+        token = b".".join([header_segment, b"e30", b"c2ln"]).decode()
+
+        with pytest.raises(DecodeError, match="duplicate header parameter"):
+            jws.get_unverified_header(token)
+
+    def test_get_unverified_header_requires_two_segments(self, jws: PyJWS) -> None:
+        header_segment = base64url_encode(json.dumps({"alg": "HS256"}).encode())
+
+        with pytest.raises(DecodeError, match="Not enough segments"):
+            jws.get_unverified_header(header_segment.decode())
+
     @pytest.mark.parametrize(
         "algo",
         [

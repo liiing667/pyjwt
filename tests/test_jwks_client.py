@@ -21,11 +21,13 @@ from jwt.jwks_client import _NoRedirectHandler
 from jwt.api_jwk import PyJWK, PyJWKSet
 from jwt.exceptions import (
     DecodeError,
+    InvalidTokenError,
     PyJWKClientConnectionError,
     PyJWKClientError,
     PyJWKSetError,
 )
 from jwt.jwk_set_cache import JWKSetCache
+from jwt.utils import base64url_encode
 
 from .utils import crypto_required
 
@@ -326,22 +328,99 @@ class TestPyJWKClient:
             "gty": "client-credentials",
         }
 
-    def test_get_signing_key_from_jwt_rejects_payload_recursion_error(self) -> None:
-        token = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0.e30."
+    def _build_token(
+        self, header: dict[str, Any], payload: bytes, signature: bytes = b"sig"
+    ) -> str:
+        header_segment = base64url_encode(
+            json.dumps(header, separators=(",", ":")).encode()
+        )
+        payload_segment = base64url_encode(payload)
+        signature_segment = base64url_encode(signature)
+        return b".".join([header_segment, payload_segment, signature_segment]).decode()
+
+    def test_get_signing_key_from_jwt_ignores_corrupt_payload(self) -> None:
+        # The payload is not valid base64url or JSON, but key selection must
+        # only read the bounded protected header and still resolve the kid.
+        header = {
+            "alg": "RS256",
+            "kid": RESPONSE_DATA_WITH_MATCHING_KID["keys"][0]["kid"],
+        }
+        header_segment = base64url_encode(
+            json.dumps(header, separators=(",", ":")).encode()
+        )
+        token_with_bad_payload = b".".join(
+            [header_segment, b"this is not valid base64url!!!", b"c2ln"]
+        ).decode()
 
         with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID) as open_mock:
             jwks_client = PyJWKClient("https://example.test/.well-known/jwks.json")
-            with mock.patch(
-                "jwt.api_jwt.json.loads",
-                side_effect=[
-                    {"alg": "RS256", "kid": "test-key"},
-                    RecursionError(),
-                ],
-            ):
-                with pytest.raises(DecodeError, match="Invalid payload") as exc:
-                    jwks_client.get_signing_key_from_jwt(token)
+            signing_key = jwks_client.get_signing_key_from_jwt(token_with_bad_payload)
 
-        assert isinstance(exc.value.__cause__, RecursionError)
+        assert signing_key.key_id == RESPONSE_DATA_WITH_MATCHING_KID["keys"][0]["kid"]
+        assert open_mock.call_count == 1
+
+        # A deeply nested payload that would blow up JSON parsing is likewise
+        # irrelevant to kid lookup; the header alone drives key selection.
+        nested_payload = b"[" * 100_000
+        token_with_nested_payload = self._build_token(header, nested_payload)
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            jwks_client = PyJWKClient("https://example.test/.well-known/jwks.json")
+            signing_key = jwks_client.get_signing_key_from_jwt(
+                token_with_nested_payload
+            )
+        assert signing_key.key_id == header["kid"]
+
+        # Full verification still rejects the bad token: the payload error is
+        # deferred to verification rather than swallowed.
+        with pytest.raises(DecodeError):
+            jwt.decode(
+                token_with_bad_payload,
+                signing_key.key,
+                algorithms=["RS256"],
+            )
+        with pytest.raises(DecodeError):
+            jwt.decode(
+                token_with_nested_payload,
+                signing_key.key,
+                algorithms=["RS256"],
+            )
+
+    def test_get_signing_key_from_jwt_rejects_oversized_header(self) -> None:
+        huge_header_segment = base64url_encode(b"a" * 9000)
+        token = b".".join([huge_header_segment, b"e30", b"c2ln"]).decode()
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID) as open_mock:
+            jwks_client = PyJWKClient("https://example.test/.well-known/jwks.json")
+            with pytest.raises(DecodeError, match="maximum size"):
+                jwks_client.get_signing_key_from_jwt(token)
+
+        # Fail closed: the oversized header never reaches the JWKS endpoint.
+        assert open_mock.call_count == 0
+
+    def test_get_signing_key_from_jwt_rejects_oversized_kid(self) -> None:
+        token = self._build_token({"alg": "RS256", "kid": "k" * 1025}, b"{}")
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID) as open_mock:
+            jwks_client = PyJWKClient("https://example.test/.well-known/jwks.json")
+            with pytest.raises(InvalidTokenError, match="Key ID header parameter"):
+                jwks_client.get_signing_key_from_jwt(token)
+
+        assert open_mock.call_count == 0
+
+    def test_get_signing_key_from_jwt_rejects_duplicate_header_parameter(
+        self,
+    ) -> None:
+        # Raw JSON with a duplicated "kid" key. json.loads would silently keep
+        # the last value; the strict header parser must fail closed instead.
+        raw_header = b'{"alg":"RS256","kid":"first","kid":"second"}'
+        header_segment = base64url_encode(raw_header)
+        token = b".".join([header_segment, b"e30", b"c2ln"]).decode()
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID) as open_mock:
+            jwks_client = PyJWKClient("https://example.test/.well-known/jwks.json")
+            with pytest.raises(DecodeError, match="duplicate header parameter"):
+                jwks_client.get_signing_key_from_jwt(token)
+
         assert open_mock.call_count == 0
 
     def test_get_jwk_set_caches_result(self) -> None:
