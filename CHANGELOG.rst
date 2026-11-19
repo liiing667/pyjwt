@@ -10,6 +10,15 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 Changed
 ~~~~~~~
 
+- Harden ``PyJWKClient`` JWKS fetching into a single validated state:
+  redirects are never followed, non-JSON ``Content-Type`` responses are
+  rejected, response bodies are bounded by the new ``max_response_size``
+  parameter (default 1 MiB), and truncated or invalid JSON no longer
+  propagates a raw ``json.JSONDecodeError``. Failed and rejected fetches
+  share the unknown-``kid`` refresh cooldown with successful ones and
+  never modify the previously cached key set, so a flapping or malicious
+  endpoint cannot wipe or poison cached keys.
+
 - Add public ``jwt.decode`` regression coverage for AWS ALB-style padded
   ES256 tokens, including rejection of tampered payloads and signatures,
   in `#1211 <https://github.com/jpadilla/pyjwt/pull/1211>`__.

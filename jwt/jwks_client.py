@@ -43,6 +43,7 @@ class PyJWKClient:
         timeout: float = 30,
         ssl_context: SSLContext | None = None,
         cooldown_duration: float = 30,
+        max_response_size: int = 1024 * 1024,
     ):
         """A client for retrieving signing keys from a JWKS endpoint.
 
@@ -60,12 +61,18 @@ class PyJWKClient:
           Defaults to ``300`` (5 minutes). Must be greater than 0.
 
         Unknown key IDs can trigger one forced refresh after the cooldown
-        period configured by ``cooldown_duration``. Every successful fetch
-        starts this cooldown, including the initial fetch and cache-expiry
-        fetches. A newly rotated key may therefore wait for the cooldown
-        period before it is fetched; set ``cooldown_duration`` to ``0`` to
-        disable this behavior. The cooldown is bypassed when
-        ``cache_jwk_set`` is ``False``.
+        period configured by ``cooldown_duration``. Every fetch attempt
+        starts this cooldown, including failed ones, so a flapping endpoint
+        is not hammered by repeated refreshes. A newly rotated key may
+        therefore wait for the cooldown period before it is fetched; set
+        ``cooldown_duration`` to ``0`` to disable this behavior. The
+        cooldown is bypassed when ``cache_jwk_set`` is ``False``.
+
+        Fetches are validated as a single unit before the cache is
+        touched: redirects are never followed, a non-JSON ``Content-Type``
+        is rejected, and the response body is bounded by
+        ``max_response_size`` bytes. If any check fails or the payload is
+        not valid JSON, the previously cached key set is left untouched.
 
         **Tier 2 — Signing key cache** (disabled by default):
         Caches individual signing keys (looked up by ``kid``) using an LRU
@@ -96,6 +103,10 @@ class PyJWKClient:
         :param cooldown_duration: Minimum time in seconds between forced
             refreshes after an unknown key ID. Defaults to ``30``.
         :type cooldown_duration: float
+        :param max_response_size: Maximum size in bytes of a JWKS response
+            body. Larger responses are rejected without updating the
+            cache. Defaults to 1 MiB.
+        :type max_response_size: int
         """
         if headers is None:
             headers = {}
@@ -124,7 +135,14 @@ class PyJWKClient:
                 f'Cooldown duration must be finite, the input is "{cooldown_duration}"'
             )
         self.cooldown_duration = cooldown_duration
+        if max_response_size <= 0:
+            raise PyJWKClientError(
+                "max_response_size must be greater than 0, "
+                f'the input is "{max_response_size}"'
+            )
+        self.max_response_size = max_response_size
         self._last_successful_fetch: float | None = None
+        self._last_failed_fetch: float | None = None
         self._client_lock = threading.RLock()
 
         if cache_jwk_set:
@@ -153,11 +171,32 @@ class PyJWKClient:
 
         :returns: The parsed JWK Set as a dictionary.
         :raises PyJWKClientConnectionError: If the HTTP request fails.
-        :raises PyJWKClientError: If the endpoint does not return a JSON
-            object.
+        :raises PyJWKClientError: If the endpoint returns a non-JSON
+            Content-Type, a body larger than ``max_response_size``, or a
+            payload that is not a JSON object.
         :raises PyJWKSetError: If the JWK Set cache is enabled and the
             response contains no usable keys.
         """
+        try:
+            jwk_set = self._fetch_jwks_payload()
+            if self.jwk_set_cache is not None:
+                # Only update the cache on a successful fetch. Writing in a
+                # `finally` block with `jwk_set=None` on error clears any
+                # previously-cached JWKS, turning a transient outage into a
+                # cache wipe that breaks legitimate auth.
+                self.jwk_set_cache.put(jwk_set)
+        except Exception:
+            # Failed and rejected fetches share the fetch-state timestamps
+            # with successful ones, so the unknown-kid cooldown also
+            # rate-limits a flapping endpoint. The cached key set is never
+            # modified on this path.
+            self._last_failed_fetch = time.monotonic()
+            raise
+
+        self._last_successful_fetch = time.monotonic()
+        return jwk_set
+
+    def _fetch_jwks_payload(self) -> dict[str, Any]:
         try:
             r = urllib.request.Request(url=self.uri, headers=self.headers)
             handlers: list[Any] = [_NoRedirectHandler()]
@@ -165,7 +204,10 @@ class PyJWKClient:
                 handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
             opener = urllib.request.build_opener(*handlers)
             with opener.open(r, timeout=self.timeout) as response:
-                jwk_set = json.load(response)
+                self._check_json_content_type(response)
+                # Read at most one byte past the budget so an oversized or
+                # unbounded body is rejected instead of buffered whole.
+                raw = response.read(self.max_response_size + 1)
         except (URLError, TimeoutError, http.client.HTTPException) as e:
             if isinstance(e, HTTPError):
                 e.close()
@@ -173,19 +215,42 @@ class PyJWKClient:
                 f'Fail to fetch data from the url, err: "{e}"'
             ) from e
 
+        if len(raw) > self.max_response_size:
+            raise PyJWKClientError(
+                "The JWKS endpoint returned a response larger than the "
+                f"maximum of {self.max_response_size} bytes"
+            )
+
+        try:
+            jwk_set = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise PyJWKClientError("The JWKS endpoint did not return valid JSON") from e
+
         # Validate the payload before it reaches the cache, so an endpoint
         # returning something that isn't a JSON object is reported as such
         # rather than as a malformed JWK Set.
-        jwk_set = self._as_jwk_set_payload(jwk_set)
+        return self._as_jwk_set_payload(jwk_set)
 
-        # Only update the cache on a successful fetch. Writing in a
-        # `finally` block with `jwk_set=None` on error clears any
-        # previously-cached JWKS, turning a transient outage into a cache
-        # wipe that breaks legitimate auth.
-        if self.jwk_set_cache is not None:
-            self.jwk_set_cache.put(jwk_set)
-        self._last_successful_fetch = time.monotonic()
-        return jwk_set
+    @staticmethod
+    def _check_json_content_type(response: Any) -> None:
+        content_type = response.headers.get("Content-Type")
+        if not isinstance(content_type, str) or not content_type.strip():
+            # Header absent (or a mocked response): nothing to enforce.
+            return
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        subtype = media_type.partition("/")[2]
+        if subtype != "json" and not subtype.endswith("+json"):
+            raise PyJWKClientError(
+                f"The JWKS endpoint returned a non-JSON Content-Type: {content_type!r}"
+            )
+
+    def _last_fetch_attempt(self) -> float | None:
+        attempts = [
+            timestamp
+            for timestamp in (self._last_successful_fetch, self._last_failed_fetch)
+            if timestamp is not None
+        ]
+        return max(attempts) if attempts else None
 
     def get_jwk_set(self, refresh: bool = False) -> PyJWKSet:
         """Return the JWK Set, using the cache when available.
@@ -279,11 +344,11 @@ class PyJWKClient:
             signing_key = self.match_kid(signing_keys, kid)
 
             if not signing_key:
+                last_fetch = self._last_fetch_attempt()
                 cooling_down = (
                     self.jwk_set_cache is not None
-                    and self._last_successful_fetch is not None
-                    and time.monotonic() - self._last_successful_fetch
-                    < self.cooldown_duration
+                    and last_fetch is not None
+                    and time.monotonic() - last_fetch < self.cooldown_duration
                 )
                 if not cooling_down:
                     signing_keys = self.get_signing_keys(refresh=True)

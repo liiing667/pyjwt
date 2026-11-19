@@ -149,6 +149,44 @@ def mocked_http_error_response() -> Iterator[tuple[mock.Mock, HTTPError]]:
         yield urlopen_mock, http_error
 
 
+@contextlib.contextmanager
+def jwks_response_server(
+    responses: list[tuple[int, dict[str, str], bytes]],
+) -> Iterator[tuple[str, dict[str, int]]]:
+    """Serve a fixed queue of offline HTTP responses.
+
+    Each request consumes the next ``(status, headers, body)`` spec; once
+    the queue is exhausted the last spec is repeated. Yields the base URL
+    and a mutable request counter.
+    """
+    state = {"requests": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+            index = min(state["requests"], len(responses) - 1)
+            state["requests"] += 1
+            status, headers, body = responses[index]
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 @crypto_required
 class TestPyJWKClient:
     def test_fetch_data_rejects_redirect_without_contacting_destination(self) -> None:
@@ -809,3 +847,130 @@ class TestPyJWKClient:
                 jwks_client.get_jwk_set()
 
             assert http_error.closed
+
+    def test_fetch_data_rejects_non_json_content_type_and_recovers(self) -> None:
+        good = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode()
+        rotated = json.dumps(RESPONSE_DATA_NO_MATCHING_KID).encode()
+        responses = [
+            (200, {"Content-Type": "application/json"}, good),
+            (200, {"Content-Type": "text/html; charset=utf-8"}, b"<html>oops</html>"),
+            (200, {"Content-Type": "application/jwk-set+json"}, rotated),
+        ]
+
+        with jwks_response_server(responses) as (base_url, state):
+            client = PyJWKClient(f"{base_url}/jwks", cooldown_duration=0)
+            first = client.get_jwk_set()
+
+            with pytest.raises(PyJWKClientError, match="Content-Type"):
+                client.get_jwk_set(refresh=True)
+
+            # The rejected response must not disturb the cached key set.
+            assert client.get_jwk_set() is first
+
+            # A healthy endpoint again: legitimate rotation still applies.
+            rotated_set = client.get_jwk_set(refresh=True)
+            assert [key.key_id for key in rotated_set.keys] == [
+                "MLYHNMMhwCNXw9roHIILFsK4nLs="
+            ]
+
+        assert state["requests"] == 3
+
+    def test_fetch_data_rejects_oversized_response_and_recovers(self) -> None:
+        good = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode()
+        # One byte of (valid JSON) padding pushes the body over the budget.
+        oversized = good + b" "
+        responses = [
+            (200, {"Content-Type": "application/json"}, good),
+            (200, {"Content-Type": "application/json"}, oversized),
+            (200, {"Content-Type": "application/json"}, good),
+        ]
+
+        with jwks_response_server(responses) as (base_url, state):
+            client = PyJWKClient(
+                f"{base_url}/jwks",
+                max_response_size=len(good),
+                cooldown_duration=0,
+            )
+            first = client.get_jwk_set()
+
+            with pytest.raises(PyJWKClientError, match="larger than the maximum"):
+                client.get_jwk_set(refresh=True)
+
+            assert client.get_jwk_set() is first
+
+            recovered = client.get_jwk_set(refresh=True)
+            assert [key.key_id for key in recovered.keys] == [
+                key.key_id for key in first.keys
+            ]
+
+        assert state["requests"] == 3
+
+    def test_fetch_data_rejects_truncated_json_and_recovers(self) -> None:
+        good = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode()
+        truncated = good[: len(good) // 2]
+        responses = [
+            (200, {"Content-Type": "application/json"}, good),
+            (200, {"Content-Type": "application/json"}, truncated),
+            (200, {"Content-Type": "application/json"}, good),
+        ]
+
+        with jwks_response_server(responses) as (base_url, state):
+            client = PyJWKClient(f"{base_url}/jwks", cooldown_duration=0)
+            first = client.get_jwk_set()
+
+            with pytest.raises(PyJWKClientError, match="valid JSON"):
+                client.get_jwk_set(refresh=True)
+
+            assert client.get_jwk_set() is first
+
+            recovered = client.get_jwk_set(refresh=True)
+            assert [key.key_id for key in recovered.keys] == [
+                key.key_id for key in first.keys
+            ]
+
+        assert state["requests"] == 3
+
+    def test_fetch_data_rejects_redirect_and_preserves_cached_keys(self) -> None:
+        good = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode()
+        responses = [
+            (200, {"Content-Type": "application/json"}, good),
+            (302, {"Location": "http://127.0.0.1:1/elsewhere"}, b""),
+        ]
+
+        with jwks_response_server(responses) as (base_url, state):
+            client = PyJWKClient(f"{base_url}/jwks", cooldown_duration=0)
+            first = client.get_jwk_set()
+
+            with pytest.raises(PyJWKClientConnectionError):
+                client.get_jwk_set(refresh=True)
+
+            assert client.get_jwk_set() is first
+
+        assert state["requests"] == 2
+
+    def test_pyjwkclient_rejects_non_positive_max_response_size(self) -> None:
+        with pytest.raises(PyJWKClientError, match="max_response_size"):
+            PyJWKClient("https://example.test/jwks.json", max_response_size=0)
+
+    def test_failed_refresh_also_starts_the_cooldown(self) -> None:
+        # A failed fetch shares the cooldown state with successful ones, so
+        # an unknown kid does not hammer a flapping endpoint.
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        kid = "unknown-kid"
+        jwks_client = PyJWKClient(url, cooldown_duration=30)
+
+        with mocked_success_response(RESPONSE_DATA_NO_MATCHING_KID):
+            jwks_client.get_jwk_set()
+
+        # Expire the success-based cooldown so the next lookup refreshes.
+        jwks_client._last_successful_fetch = 0
+        with mocked_failed_response() as failed_call:
+            with pytest.raises(PyJWKClientConnectionError):
+                jwks_client.get_signing_key(kid)
+        assert failed_call.call_count == 1
+
+        # The failure itself opened a new cooldown window: no retry.
+        with mocked_failed_response() as second_call:
+            with pytest.raises(PyJWKClientError, match="matches"):
+                jwks_client.get_signing_key(kid)
+        assert second_call.call_count == 0
