@@ -60,16 +60,63 @@ RESPONSE_DATA_NO_MATCHING_KID = {
 }
 
 
+def _jwks_headers() -> Message:
+    headers = Message()
+    headers.add_header("Content-Type", "application/json")
+    return headers
+
+
+def _mock_response(
+    *,
+    read_side_effect: Any = None,
+    read_return_value: Any = None,
+    headers: Message | None = None,
+) -> mock.Mock:
+    response = mock.Mock()
+    response.__enter__ = mock.Mock(return_value=response)
+    # A plain Mock's __exit__ returns a truthy Mock, which the `with`
+    # statement treats as "suppress the exception" and would hide any
+    # error raised while validating the response body.
+    response.__exit__ = mock.Mock(return_value=False)
+    response.headers = headers if headers is not None else _jwks_headers()
+    if read_side_effect is not None:
+        response.read.side_effect = read_side_effect
+    else:
+        # A real response stream returns EOF (b"") once the body has been
+        # consumed; model that explicitly so chunked reads terminate.
+        response.read.side_effect = [read_return_value, b""]
+    return response
+
+
+class _RepeatingBodyReader:
+    """Mimics a response stream that can be re-read after each open().
+
+    Each ``open()`` returns the same response object, so its ``read`` has
+    to serve the full body followed by EOF on every fetch. A two-state
+    cycle models that because each fetch performs exactly two reads.
+    """
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self._at_eof = False
+
+    def __call__(self, _size: int = -1) -> bytes:
+        if self._at_eof:
+            self._at_eof = False
+            return b""
+        self._at_eof = True
+        return self._body
+
+
 @contextlib.contextmanager
 def mocked_success_response(data: object) -> Iterator[mock.Mock]:
     with mock.patch("urllib.request.build_opener") as build_opener_mock:
         opener = mock.Mock()
         build_opener_mock.return_value = opener
         urlopen_mock = opener.open
-        response = mock.Mock()
-        response.__enter__ = mock.Mock(return_value=response)
-        response.__exit__ = mock.Mock()
-        response.read.side_effect = [json.dumps(data)]
+        response = _mock_response(
+            read_side_effect=[json.dumps(data).encode("utf-8"), b""]
+        )
         urlopen_mock.return_value = response
         yield urlopen_mock
 
@@ -92,13 +139,14 @@ def mocked_first_call_wrong_kid_second_call_correct_kid(
         opener = mock.Mock()
         build_opener_mock.return_value = opener
         urlopen_mock = opener.open
-        response = mock.Mock()
-        response.__enter__ = mock.Mock(return_value=response)
-        response.__exit__ = mock.Mock()
-        response.read.side_effect = [
-            json.dumps(response_data_one),
-            json.dumps(response_data_two),
-        ]
+        response = _mock_response(
+            read_side_effect=[
+                json.dumps(response_data_one).encode("utf-8"),
+                b"",
+                json.dumps(response_data_two).encode("utf-8"),
+                b"",
+            ]
+        )
         urlopen_mock.return_value = response
         yield urlopen_mock
 
@@ -121,8 +169,7 @@ def mocked_incomplete_read_response() -> Iterator[mock.Mock]:
         opener = mock.Mock()
         build_opener_mock.return_value = opener
         urlopen_mock = opener.open
-        response = mock.Mock()
-        response.__enter__ = mock.Mock(return_value=response)
+        response = _mock_response()
         # A truthy __exit__ return value tells the `with` statement to
         # suppress whatever exception was raised in its body, which would
         # hide the IncompleteRead below before fetch_data() ever sees it.
@@ -147,6 +194,63 @@ def mocked_http_error_response() -> Iterator[tuple[mock.Mock, HTTPError]]:
         )
         urlopen_mock.side_effect = http_error
         yield urlopen_mock, http_error
+
+
+class _ScriptedJWKSHandler(BaseHTTPRequestHandler):
+    # Responses handed out in order; each item is a dict with keys
+    # ``status``, ``content_type`` and ``body``.
+    script: list[dict[str, Any]] = []
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+        if not self.script:
+            self.send_response(500)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"no scripted response left")
+            return
+        step = self.script.pop(0)
+        self.send_response(step["status"])
+        self.send_header("Content-Type", step["content_type"])
+        self.send_header("Content-Length", str(len(step["body"])))
+        self.end_headers()
+        self.wfile.write(step["body"])
+
+    def log_message(self, _format: str, *args: object) -> None:
+        return
+
+
+@contextlib.contextmanager
+def scripted_jwks_server(
+    script: list[dict[str, Any]],
+) -> Iterator[str]:
+    """Serve fixed, offline JWKS responses from ``script`` in order."""
+    handler = type(
+        "ConfiguredScriptedJWKSHandler",
+        (_ScriptedJWKSHandler,),
+        {"script": list(script)},
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/jwks.json"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def _jwks_step(
+    data: object,
+    *,
+    status: int = 200,
+    content_type: str = "application/json",
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "content_type": content_type,
+        "body": json.dumps(data).encode("utf-8"),
+    }
 
 
 @crypto_required
@@ -588,10 +692,11 @@ class TestPyJWKClient:
         with mock.patch("urllib.request.build_opener") as build_opener_mock:
             opener = mock.Mock()
             build_opener_mock.return_value = opener
-            response = mock.Mock()
-            response.__enter__ = mock.Mock(return_value=response)
-            response.__exit__ = mock.Mock()
-            response.read.return_value = json.dumps(RESPONSE_DATA_NO_MATCHING_KID)
+            response = _mock_response(
+                read_return_value=json.dumps(RESPONSE_DATA_NO_MATCHING_KID).encode(
+                    "utf-8"
+                )
+            )
             opener.open.return_value = response
 
             for _ in range(2):
@@ -608,10 +713,11 @@ class TestPyJWKClient:
         with mock.patch("urllib.request.build_opener") as build_opener_mock:
             opener = mock.Mock()
             build_opener_mock.return_value = opener
-            response = mock.Mock()
-            response.__enter__ = mock.Mock(return_value=response)
-            response.__exit__ = mock.Mock()
-            response.read.return_value = json.dumps(RESPONSE_DATA_NO_MATCHING_KID)
+            response = _mock_response(
+                read_side_effect=_RepeatingBodyReader(
+                    json.dumps(RESPONSE_DATA_NO_MATCHING_KID).encode("utf-8")
+                )
+            )
             opener.open.return_value = response
 
             clock = [0.0]
@@ -637,10 +743,11 @@ class TestPyJWKClient:
         with mock.patch("urllib.request.build_opener") as build_opener_mock:
             opener = mock.Mock()
             build_opener_mock.return_value = opener
-            response = mock.Mock()
-            response.__enter__ = mock.Mock(return_value=response)
-            response.__exit__ = mock.Mock()
-            response.read.return_value = json.dumps(RESPONSE_DATA_NO_MATCHING_KID)
+            response = _mock_response(
+                read_side_effect=_RepeatingBodyReader(
+                    json.dumps(RESPONSE_DATA_NO_MATCHING_KID).encode("utf-8")
+                )
+            )
 
             opener.open.return_value = response
             jwks_client.get_jwk_set()
@@ -691,15 +798,18 @@ class TestPyJWKClient:
         with mock.patch("urllib.request.build_opener") as build_opener_mock:
             opener = mock.Mock()
             build_opener_mock.return_value = opener
-            response = mock.Mock()
-            response.__enter__ = mock.Mock(return_value=response)
-            response.__exit__ = mock.Mock()
-            response.read.side_effect = [
-                json.dumps(RESPONSE_DATA_NO_MATCHING_KID),
-                json.dumps(RESPONSE_DATA_NO_MATCHING_KID),
-                json.dumps(RESPONSE_DATA_NO_MATCHING_KID),
-                json.dumps(RESPONSE_DATA_NO_MATCHING_KID),
-            ]
+            response = _mock_response(
+                read_side_effect=[
+                    json.dumps(RESPONSE_DATA_NO_MATCHING_KID).encode("utf-8"),
+                    b"",
+                    json.dumps(RESPONSE_DATA_NO_MATCHING_KID).encode("utf-8"),
+                    b"",
+                    json.dumps(RESPONSE_DATA_NO_MATCHING_KID).encode("utf-8"),
+                    b"",
+                    json.dumps(RESPONSE_DATA_NO_MATCHING_KID).encode("utf-8"),
+                    b"",
+                ]
+            )
             opener.open.return_value = response
 
             for _ in range(2):
@@ -774,10 +884,11 @@ class TestPyJWKClient:
         with mock.patch("urllib.request.build_opener") as build_opener_mock:
             opener = mock.Mock()
             build_opener_mock.return_value = opener
-            response = mock.Mock()
-            response.__enter__ = mock.Mock(return_value=response)
-            response.__exit__ = mock.Mock()
-            response.read.return_value = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID)
+            response = _mock_response(
+                read_return_value=json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode(
+                    "utf-8"
+                )
+            )
             opener.open.return_value = response
             jwk_set = jwks_client.get_jwk_set()
             handlers = build_opener_mock.call_args.args
@@ -809,3 +920,316 @@ class TestPyJWKClient:
                 jwks_client.get_jwk_set()
 
             assert http_error.closed
+
+    @pytest.mark.parametrize("bad_size", [0, -1, 1.5, "65536", None])
+    def test_rejects_invalid_max_response_size(self, bad_size: object) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        with pytest.raises(PyJWKClientError, match="max_response_size"):
+            PyJWKClient(url, max_response_size=bad_size)  # type: ignore[arg-type]
+
+    def test_fetch_data_rejects_wrong_content_type_and_keeps_cache(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            original = jwks_client.get_jwk_set()
+
+        bad_headers = Message()
+        bad_headers.add_header("Content-Type", "text/html; charset=utf-8")
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            opener.open.return_value = _mock_response(
+                read_return_value=b"<html>bad gateway</html>",
+                headers=bad_headers,
+            )
+            with pytest.raises(PyJWKClientError, match="Content-Type"):
+                jwks_client.fetch_data()
+
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.get() is original
+
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/jwk-set+json",
+            "APPLICATION/JSON",
+        ],
+    )
+    def test_fetch_data_accepts_json_content_types(self, content_type: str) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+        headers = Message()
+        headers.add_header("Content-Type", content_type)
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            opener.open.return_value = _mock_response(
+                read_return_value=json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode(
+                    "utf-8"
+                ),
+                headers=headers,
+            )
+            jwk_set = jwks_client.fetch_data()
+
+        assert jwk_set["keys"][0]["kid"] == (
+            "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        )
+
+    def test_fetch_data_rejects_oversized_body_and_keeps_cache(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            original = jwks_client.get_jwk_set()
+
+        jwks_client.max_response_size = 64
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            opener.open.return_value = _mock_response(
+                read_return_value=json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode(
+                    "utf-8"
+                )
+            )
+            with pytest.raises(PyJWKClientError, match="exceeded the maximum size"):
+                jwks_client.fetch_data()
+
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.get() is original
+
+    def test_fetch_data_rejects_truncated_json_and_keeps_cache(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            original = jwks_client.get_jwk_set()
+
+        full_body = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode("utf-8")
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            opener.open.return_value = _mock_response(
+                read_return_value=full_body[: len(full_body) // 2]
+            )
+            with pytest.raises(PyJWKClientError, match="did not return valid JSON"):
+                jwks_client.fetch_data()
+
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.get() is original
+
+    def test_fetch_data_rejects_empty_key_set_and_keeps_cache(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            original = jwks_client.get_jwk_set()
+
+        with pytest.raises(PyJWKSetError):
+            with mocked_success_response({"keys": []}):
+                jwks_client.fetch_data()
+
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.get() is original
+
+    def test_failed_fetch_does_not_advance_cooldown_clock(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            jwks_client.get_jwk_set()
+        assert jwks_client._last_successful_fetch is not None
+        clock_at_success = jwks_client._last_successful_fetch
+
+        bad_headers = Message()
+        bad_headers.add_header("Content-Type", "text/html")
+        with pytest.raises(PyJWKClientError):
+            with mock.patch("urllib.request.build_opener") as build_opener_mock:
+                opener = mock.Mock()
+                build_opener_mock.return_value = opener
+                opener.open.return_value = _mock_response(
+                    read_return_value=b"not json at all",
+                    headers=bad_headers,
+                )
+                jwks_client.fetch_data()
+
+        assert jwks_client._last_successful_fetch == clock_at_success
+
+    def test_offline_redirect_is_rejected_then_recovers_with_cached_keys(
+        self,
+    ) -> None:
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        script = [
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+            {
+                "status": 302,
+                "content_type": "text/plain",
+                "body": b"",
+            },
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+        ]
+        with scripted_jwks_server(script) as url:
+            jwks_client = PyJWKClient(url, cooldown_duration=0)
+
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            with pytest.raises(PyJWKClientConnectionError):
+                jwks_client.get_jwk_set(refresh=True)
+
+            # The old key set stays authoritative after the rejection.
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            # Recovery: a valid response replaces the cached set normally.
+            recovered = jwks_client.get_jwk_set(refresh=True)
+            assert [key.key_id for key in recovered.keys] == [kid]
+
+    def test_offline_wrong_content_type_is_rejected_then_recovers(self) -> None:
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        script = [
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+            {
+                "status": 200,
+                "content_type": "text/html",
+                "body": b"<html>service unavailable</html>",
+            },
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+        ]
+        with scripted_jwks_server(script) as url:
+            jwks_client = PyJWKClient(url, cooldown_duration=0)
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            with pytest.raises(PyJWKClientError, match="Content-Type"):
+                jwks_client.get_jwk_set(refresh=True)
+
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            recovered = jwks_client.get_jwk_set(refresh=True)
+            assert recovered[kid].key_id == kid
+
+    def test_offline_oversized_body_is_rejected_then_recovers(self) -> None:
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        oversized = {
+            "keys": [
+                {
+                    **RESPONSE_DATA_WITH_MATCHING_KID["keys"][0],
+                    "padding": "x" * 4096,
+                }
+            ]
+        }
+        script = [
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+            _jwks_step(oversized),
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+        ]
+        with scripted_jwks_server(script) as url:
+            jwks_client = PyJWKClient(url, cooldown_duration=0, max_response_size=2048)
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            with pytest.raises(PyJWKClientError, match="exceeded the maximum size"):
+                jwks_client.get_jwk_set(refresh=True)
+
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            recovered = jwks_client.get_jwk_set(refresh=True)
+            assert recovered[kid].key_id == kid
+
+    def test_offline_truncated_json_is_rejected_then_recovers(self) -> None:
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        full_body = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode("utf-8")
+        script = [
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+            {
+                "status": 200,
+                "content_type": "application/json",
+                "body": full_body[: len(full_body) // 2],
+            },
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+        ]
+        with scripted_jwks_server(script) as url:
+            jwks_client = PyJWKClient(url, cooldown_duration=0)
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            with pytest.raises(PyJWKClientError, match="did not return valid JSON"):
+                jwks_client.get_jwk_set(refresh=True)
+
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            recovered = jwks_client.get_jwk_set(refresh=True)
+            assert recovered[kid].key_id == kid
+
+    def test_offline_legitimate_rotation_replaces_the_cached_set(self) -> None:
+        old_kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        rotated_key = copy.deepcopy(RESPONSE_DATA_NO_MATCHING_KID["keys"][0])
+        rotated_kid = rotated_key["kid"]
+        script = [
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+            _jwks_step({"keys": [rotated_key]}),
+        ]
+        with scripted_jwks_server(script) as url:
+            jwks_client = PyJWKClient(url, cooldown_duration=0)
+            assert jwks_client.get_signing_key(old_kid).key_id == old_kid
+
+            rotated = jwks_client.get_jwk_set(refresh=True)
+            assert [key.key_id for key in rotated.keys] == [rotated_kid]
+
+            # The old kid is gone from the rotated set; the new one works.
+            with pytest.raises(KeyError):
+                rotated[old_kid]
+            assert jwks_client.get_signing_key(rotated_kid).key_id == rotated_kid
+
+    def test_offline_empty_key_set_is_rejected_then_recovers(self) -> None:
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        script = [
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+            _jwks_step({"keys": []}),
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+        ]
+        with scripted_jwks_server(script) as url:
+            jwks_client = PyJWKClient(url, cooldown_duration=0)
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            with pytest.raises(PyJWKSetError):
+                jwks_client.get_jwk_set(refresh=True)
+
+            # The previous, non-empty key set remains the cached state.
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            recovered = jwks_client.get_jwk_set(refresh=True)
+            assert recovered[kid].key_id == kid
+
+    def test_successful_rotation_updates_cache_and_cooldown_together(self) -> None:
+        rotated_key = copy.deepcopy(RESPONSE_DATA_NO_MATCHING_KID["keys"][0])
+        rotated_kid = rotated_key["kid"]
+        script = [
+            _jwks_step(RESPONSE_DATA_WITH_MATCHING_KID),
+            _jwks_step({"keys": [rotated_key]}),
+        ]
+        with scripted_jwks_server(script) as url:
+            jwks_client = PyJWKClient(url)
+            jwks_client.get_jwk_set()
+            assert jwks_client.jwk_set_cache is not None
+            cached_entry = jwks_client.jwk_set_cache.jwk_set_with_timestamp
+            assert cached_entry is not None
+            first_timestamp = cached_entry.get_timestamp()
+            first_fetch = jwks_client._last_successful_fetch
+            assert first_fetch is not None
+            assert abs(first_timestamp - first_fetch) < 0.01
+
+            time.sleep(0.01)
+            rotated = jwks_client.get_jwk_set(refresh=True)
+
+            rotated_entry = jwks_client.jwk_set_cache.jwk_set_with_timestamp
+            assert rotated_entry is not None
+            assert rotated_entry.get_jwk_set() is rotated
+            assert rotated_entry.get_timestamp() > first_timestamp
+            assert jwks_client._last_successful_fetch is not None
+            assert (
+                abs(jwks_client._last_successful_fetch - rotated_entry.get_timestamp())
+                < 0.01
+            )
+            assert jwks_client._last_successful_fetch is not None
+            assert jwks_client.get_signing_key(rotated_kid).key_id == rotated_kid

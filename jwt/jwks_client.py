@@ -17,6 +17,17 @@ from .api_jwt import decode_complete as decode_token
 from .exceptions import PyJWKClientConnectionError, PyJWKClientError
 from .jwk_set_cache import JWKSetCache
 
+#: Default upper bound, in bytes, on a JWKS response body. JWKS documents
+#: are small JSON objects; a response larger than this is treated as a
+#: misbehaving (or compromised) endpoint rather than being buffered without
+#: limit.
+DEFAULT_MAX_RESPONSE_SIZE = 64 * 1024
+
+#: Media types that legitimately carry a JWKS payload. RFC 7517 section 5
+#: registers ``application/jwk-set+json``; plain ``application/json`` is
+#: what virtually every deployed endpoint actually serves.
+_JSON_CONTENT_TYPES = frozenset(("application/json", "application/jwk-set+json"))
+
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(
@@ -43,6 +54,7 @@ class PyJWKClient:
         timeout: float = 30,
         ssl_context: SSLContext | None = None,
         cooldown_duration: float = 30,
+        max_response_size: int = DEFAULT_MAX_RESPONSE_SIZE,
     ):
         """A client for retrieving signing keys from a JWKS endpoint.
 
@@ -96,6 +108,10 @@ class PyJWKClient:
         :param cooldown_duration: Minimum time in seconds between forced
             refreshes after an unknown key ID. Defaults to ``30``.
         :type cooldown_duration: float
+        :param max_response_size: Maximum size, in bytes, of a JWKS
+            response body. Larger responses are rejected without touching
+            the cache. Defaults to 64 KiB. Must be a positive integer.
+        :type max_response_size: int
         """
         if headers is None:
             headers = {}
@@ -124,6 +140,12 @@ class PyJWKClient:
                 f'Cooldown duration must be finite, the input is "{cooldown_duration}"'
             )
         self.cooldown_duration = cooldown_duration
+        if not isinstance(max_response_size, int) or max_response_size <= 0:
+            raise PyJWKClientError(
+                "max_response_size must be a positive integer, the input is "
+                f'"{max_response_size}"'
+            )
+        self.max_response_size = max_response_size
         self._last_successful_fetch: float | None = None
         self._client_lock = threading.RLock()
 
@@ -148,15 +170,25 @@ class PyJWKClient:
         """Fetch the JWK Set from the JWKS endpoint.
 
         Makes an HTTP request to the configured ``uri`` and returns the
-        parsed JSON response. If the JWK Set cache is enabled, the
-        response is stored in the cache.
+        parsed JSON payload. The response is accepted only when all of the
+        following hold:
+
+        - it is a direct response with no redirect;
+        - its ``Content-Type`` is JSON (``application/json`` or
+          ``application/jwk-set+json``);
+        - its body fits within ``max_response_size`` bytes;
+        - the body parses as a JSON object holding a usable JWK Set.
+
+        The JWK Set cache, including the timestamp used by the
+        unknown-kid cooldown, is updated only after every check passes, so
+        a redirect, an HTML error page, an oversized or truncated body, or
+        a payload without usable keys can never replace or wipe a
+        previously cached key set.
 
         :returns: The parsed JWK Set as a dictionary.
         :raises PyJWKClientConnectionError: If the HTTP request fails.
-        :raises PyJWKClientError: If the endpoint does not return a JSON
-            object.
-        :raises PyJWKSetError: If the JWK Set cache is enabled and the
-            response contains no usable keys.
+        :raises PyJWKClientError: If the response fails any of the
+            validation checks above.
         """
         try:
             r = urllib.request.Request(url=self.uri, headers=self.headers)
@@ -165,27 +197,95 @@ class PyJWKClient:
                 handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
             opener = urllib.request.build_opener(*handlers)
             with opener.open(r, timeout=self.timeout) as response:
-                jwk_set = json.load(response)
+                headers = response.headers
+                read = response.read
+                # Reading inside the transport try keeps dropped
+                # connections (e.g. http.client.IncompleteRead) classified
+                # as connection errors. Byte-budget enforcement raises a
+                # PyJWKClientError, which is not caught here and therefore
+                # surfaces as a validation failure rather than a transport
+                # one.
+                body = self._read_bounded_body(read)
         except (URLError, TimeoutError, http.client.HTTPException) as e:
             if isinstance(e, HTTPError):
                 e.close()
+            if isinstance(e, PyJWKClientError):
+                # Validation failures raised while reading (byte budget)
+                # are not transport errors; propagate them unchanged.
+                raise
             raise PyJWKClientConnectionError(
                 f'Fail to fetch data from the url, err: "{e}"'
             ) from e
 
-        # Validate the payload before it reaches the cache, so an endpoint
-        # returning something that isn't a JSON object is reported as such
-        # rather than as a malformed JWK Set.
-        jwk_set = self._as_jwk_set_payload(jwk_set)
+        self._require_json_content_type(headers)
 
-        # Only update the cache on a successful fetch. Writing in a
-        # `finally` block with `jwk_set=None` on error clears any
-        # previously-cached JWKS, turning a transient outage into a cache
-        # wipe that breaks legitimate auth.
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as e:
+            # Includes bodies truncated mid-document: the partial bytes
+            # must not be merged with the previously cached set.
+            raise PyJWKClientError("The JWKS endpoint did not return valid JSON") from e
+
+        payload = self._as_jwk_set_payload(payload)
+
+        # Fully parse the key set before committing anything to the cache.
+        # An empty set or a document whose keys are all unusable raises
+        # here while the previously cached set stays untouched.
+        parsed_jwk_set = PyJWKSet.from_dict(payload)
+        self._commit_jwk_set(parsed_jwk_set)
+        return payload
+
+    def _commit_jwk_set(self, jwk_set: PyJWKSet) -> None:
+        """Store *jwk_set* and its fetch timestamp as one state change.
+
+        The cache entry and ``_last_successful_fetch`` always describe the
+        same response, so a failure can never leave the cooldown clock
+        advanced while the cache still holds the old key set (or vice
+        versa).
+        """
         if self.jwk_set_cache is not None:
             self.jwk_set_cache.put(jwk_set)
         self._last_successful_fetch = time.monotonic()
-        return jwk_set
+
+    def _require_json_content_type(self, headers: Any) -> None:
+        content_type_getter = getattr(headers, "get_content_type", None)
+        if callable(content_type_getter):
+            content_type = headers.get_content_type()
+        else:
+            content_type = self._parse_content_type(headers.get("Content-Type", ""))
+        if not isinstance(content_type, str):
+            content_type = self._parse_content_type(headers.get("Content-Type", ""))
+        if content_type not in _JSON_CONTENT_TYPES:
+            raise PyJWKClientError(
+                "The JWKS endpoint returned an unexpected Content-Type: "
+                f"{content_type!r}"
+            )
+
+    @staticmethod
+    def _parse_content_type(header_value: str) -> str:
+        return header_value.split(";", 1)[0].strip().lower()
+
+    def _read_bounded_body(self, read: Any) -> bytes:
+        """Read the response body while enforcing the byte budget.
+
+        Reading in chunks keeps the memory footprint at
+        ``max_response_size`` plus one chunk instead of buffering an
+        arbitrarily large body before its size is known.
+        """
+        chunks: list[bytes] = []
+        total_size = 0
+        while True:
+            chunk = read(8192)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total_size += len(chunk)
+            if total_size > self.max_response_size:
+                raise PyJWKClientError(
+                    "The JWKS endpoint response exceeded the maximum size "
+                    f"of {self.max_response_size} bytes"
+                )
+        return b"".join(chunks)
 
     def get_jwk_set(self, refresh: bool = False) -> PyJWKSet:
         """Return the JWK Set, using the cache when available.
@@ -198,7 +298,7 @@ class PyJWKClient:
         :raises PyJWKClientError: If the endpoint does not return a JSON
             object.
         """
-        data = None
+        data: Any = None
         fetched = False
         if self.jwk_set_cache is not None and not refresh:
             data = self.jwk_set_cache.get()
@@ -207,18 +307,18 @@ class PyJWKClient:
             data = self.fetch_data()
             fetched = True
 
-        # A cache hit is already parsed, so serve it as-is. Only a fresh
-        # fetch reaches the check below, which still matters because
-        # `fetch_data()` may be overridden by a subclass.
         if isinstance(data, PyJWKSet):
-            jwk_set = data
-        else:
-            jwk_set = PyJWKSet.from_dict(self._as_jwk_set_payload(data))
+            # Cache hit, or a successful base `fetch_data()`, which now
+            # commits the fully parsed key set atomically.
+            return data
 
-        # `fetch_data()` caches the payload it received from the endpoint,
-        # but a subclass may filter or transform it before returning. Cache
-        # the value actually being returned, so later cache hits serve the
-        # same key set as this call rather than the pre-transform one.
+        # Only an overridden `fetch_data()` in a subclass can reach here,
+        # since the base implementation always commits a parsed PyJWKSet.
+        jwk_set = PyJWKSet.from_dict(self._as_jwk_set_payload(data))
+
+        # The subclass may filter or transform the payload before
+        # returning. Cache the value actually being returned so later cache
+        # hits serve the same key set rather than the pre-transform one.
         if fetched and self.jwk_set_cache is not None:
             self.jwk_set_cache.put(jwk_set)
 
@@ -287,7 +387,10 @@ class PyJWKClient:
                 )
                 if not cooling_down:
                     signing_keys = self.get_signing_keys(refresh=True)
-                    self._last_successful_fetch = time.monotonic()
+                    # `fetch_data()` already advanced
+                    # `_last_successful_fetch` atomically with the cache;
+                    # touching it here would desynchronize the cooldown
+                    # clock from the cached key set.
                     signing_key = self.match_kid(signing_keys, kid)
 
                 if not signing_key:

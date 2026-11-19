@@ -14,6 +14,25 @@ Changed
   ES256 tokens, including rejection of tampered payloads and signatures,
   in `#1211 <https://github.com/jpadilla/pyjwt/pull/1211>`__.
 
+Fixed
+~~~~~
+
+- ``PyJWKClient`` now validates the JWKS response ``Content-Type``
+  (``application/json`` or ``application/jwk-set+json``), enforces a
+  configurable ``max_response_size`` byte budget while reading the body,
+  and treats truncated or otherwise invalid JSON as a client error. The
+  JWK Set cache and the unknown-kid cooldown timestamp are committed
+  together only after the full response parses into a usable key set, so
+  a redirect, an HTML error page, an oversized or half-written body, or
+  an empty key set can no longer replace or wipe a previously cached key
+  set while legitimate key rotation still updates it.
+
+Added
+~~~~~
+
+- ``PyJWKClient`` accepts a ``max_response_size`` argument (default
+  64 KiB) to cap the size of an accepted JWKS response body.
+
 `v2.15.1 <https://github.com/jpadilla/pyjwt/compare/2.15.0...2.15.1>`__
 -----------------------------------------------------------------------
 
