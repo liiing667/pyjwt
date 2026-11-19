@@ -1,4 +1,6 @@
+import copy
 import json
+from typing import Any
 
 import pytest
 
@@ -389,3 +391,184 @@ class TestPyJWKSet:
     def test_missing_crypto_library_raises_when_required(self) -> None:
         with pytest.raises(MissingCryptographyError):
             PyJWKSet(keys=[{"kty": "RSA"}])
+
+
+def _load_jwk_fixture(name: str) -> dict[str, Any]:
+    with open(key_path(name)) as keyfile:
+        return json.loads(keyfile.read())
+
+
+@pytest.fixture(scope="module")
+def ambiguous_matrix() -> dict[str, Any]:
+    shared_kid = "shared-kid"
+    rsa_sig = copy.deepcopy(_load_jwk_fixture("jwk_rsa_pub.json"))
+    rsa_sig.update(kid=shared_kid, use="sig", alg="RS256")
+
+    rsa_cert = copy.deepcopy(rsa_sig)
+    rsa_cert["x5c"] = ["MIIBdummyCertificateChain"]
+
+    rsa_private_sig = copy.deepcopy(_load_jwk_fixture("jwk_rsa_key.json"))
+    rsa_private_sig.update(kid=shared_kid, use="sig", alg="RS256")
+
+    ec_sig = copy.deepcopy(_load_jwk_fixture("jwk_ec_pub_P-256.json"))
+    ec_sig.update(kid=shared_kid, use="sig")
+
+    hmac_sig = copy.deepcopy(_load_jwk_fixture("jwk_hmac.json"))
+    hmac_sig["kid"] = shared_kid
+
+    return {
+        "kid": shared_kid,
+        "keys": [rsa_sig, rsa_cert, rsa_private_sig, ec_sig, hmac_sig],
+        "rsa_sig": rsa_sig,
+        "rsa_cert": rsa_cert,
+        "rsa_private_sig": rsa_private_sig,
+        "ec_sig": ec_sig,
+        "hmac_sig": hmac_sig,
+    }
+
+
+@pytest.fixture(scope="module")
+def ambiguous_jwk_set(ambiguous_matrix: dict[str, Any]) -> PyJWKSet:
+    return PyJWKSet.from_dict({"keys": ambiguous_matrix["keys"]})
+
+
+@crypto_required
+class TestPyJWKSetAmbiguousKid:
+    """Selection over a fixed JWK Set whose members share one ``kid``.
+
+    The matrix deliberately contains the members that a naive "first match
+    on ``kid``" lookup confuses: an RSA public key, its private counterpart,
+    an EC public key, an HMAC secret and an X.509-backed copy of the RSA
+    public key. Every case below pins down either an exact hit or a
+    fail-closed rejection.
+    """
+
+    def test_members_keep_their_distinct_shapes(
+        self,
+        ambiguous_jwk_set: PyJWKSet,
+        ambiguous_matrix: dict[str, Any],
+    ) -> None:
+        by_shape = {
+            (
+                key.key_type,
+                key.algorithm_name,
+                key.is_private_key,
+                key.has_certificate_chain,
+            ): key
+            for key in ambiguous_jwk_set.keys
+        }
+
+        assert len(ambiguous_jwk_set.keys) == 5
+        assert {key.key_id for key in ambiguous_jwk_set.keys} == {
+            ambiguous_matrix["kid"]
+        }
+        assert by_shape[("RSA", "RS256", False, False)].public_key_use == "sig"
+        assert by_shape[("RSA", "RS256", False, True)].has_certificate_chain
+        assert by_shape[("RSA", "RS256", True, False)].is_private_key
+        assert by_shape[("EC", "ES256", False, False)].key_type == "EC"
+        assert by_shape[("oct", "HS256", False, False)].key_type == "oct"
+
+    @pytest.mark.parametrize(
+        ("selector", "expected"),
+        [
+            ({"algorithm": "ES256"}, ("EC", "ES256", False)),
+            ({"algorithm": "HS256"}, ("oct", "HS256", False)),
+            ({"key_type": "EC"}, ("EC", "ES256", False)),
+            ({"key_type": "oct"}, ("oct", "HS256", False)),
+        ],
+    )
+    def test_find_key_hits_unique_member(
+        self,
+        ambiguous_jwk_set: PyJWKSet,
+        ambiguous_matrix: dict[str, Any],
+        selector: dict[str, Any],
+        expected: tuple[str, str, bool],
+    ) -> None:
+        key = ambiguous_jwk_set.find_key(ambiguous_matrix["kid"], **selector)
+
+        assert (key.key_type, key.algorithm_name, key.is_private_key) == expected
+
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            {"algorithm": "ES384"},
+            {"key_type": "OKP"},
+            {"algorithm": "RS256", "intended_use": "enc"},
+        ],
+    )
+    def test_find_key_rejects_when_no_member_matches(
+        self,
+        ambiguous_jwk_set: PyJWKSet,
+        ambiguous_matrix: dict[str, Any],
+        selector: dict[str, Any],
+    ) -> None:
+        with pytest.raises(KeyError):
+            ambiguous_jwk_set.find_key(ambiguous_matrix["kid"], **selector)
+
+    def test_find_key_rejects_unknown_kid(self, ambiguous_jwk_set: PyJWKSet) -> None:
+        with pytest.raises(KeyError):
+            ambiguous_jwk_set.find_key("kid-not-in-set")
+
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            {},
+            {"key_type": "RSA"},
+            {"algorithm": "RS256"},
+            {"algorithm": "RS256", "allow_private": True},
+            {"algorithm": "RS256", "key_type": "RSA", "allow_private": True},
+        ],
+    )
+    def test_find_key_fails_closed_on_ambiguity(
+        self,
+        ambiguous_jwk_set: PyJWKSet,
+        ambiguous_matrix: dict[str, Any],
+        selector: dict[str, Any],
+    ) -> None:
+        with pytest.raises(PyJWKSetError, match="ambiguous"):
+            ambiguous_jwk_set.find_key(ambiguous_matrix["kid"], **selector)
+
+    def test_indexing_uses_the_same_strict_selection(
+        self, ambiguous_jwk_set: PyJWKSet, ambiguous_matrix: dict[str, Any]
+    ) -> None:
+        # A disambiguated lookup still works through __getitem__'s kid-only
+        # contract when the set has a single member for the kid.
+        unique = copy.deepcopy(_load_jwk_fixture("jwk_ec_pub_P-256.json"))
+        unique.update(kid="single-kid", use="sig")
+        single_member_set = PyJWKSet.from_dict({"keys": [unique]})
+
+        assert single_member_set["single-kid"].key_id == "single-kid"
+
+        with pytest.raises(KeyError):
+            single_member_set["missing-kid"]
+
+        with pytest.raises(PyJWKSetError, match="ambiguous"):
+            ambiguous_jwk_set[ambiguous_matrix["kid"]]
+
+    def test_matches_checks_every_selector(
+        self, ambiguous_matrix: dict[str, Any]
+    ) -> None:
+        kid = ambiguous_matrix["kid"]
+        private_key = PyJWK(ambiguous_matrix["rsa_private_sig"])
+        public_key = PyJWK(ambiguous_matrix["rsa_sig"])
+        ec_key = PyJWK(ambiguous_matrix["ec_sig"])
+
+        assert public_key.matches(kid, algorithm="RS256")
+        assert not public_key.matches(kid, algorithm="ES256")
+        assert not public_key.matches("other-kid", algorithm="RS256")
+        assert not public_key.matches(kid, intended_use="enc")
+        assert not private_key.matches(kid, algorithm="RS256")
+        assert private_key.matches(kid, algorithm="RS256", allow_private=True)
+        assert ec_key.matches(kid, key_type="EC")
+        assert not ec_key.matches(kid, key_type="RSA")
+
+    def test_legitimate_rotation_with_distinct_kids_still_resolves(self) -> None:
+        first = copy.deepcopy(_load_jwk_fixture("jwk_rsa_pub.json"))
+        first.update(kid="rotation-kid-1", use="sig", alg="RS256")
+        second = copy.deepcopy(_load_jwk_fixture("jwk_ec_pub_P-256.json"))
+        second.update(kid="rotation-kid-2", use="sig")
+
+        rotating_set = PyJWKSet.from_dict({"keys": [first, second]})
+
+        assert rotating_set.find_key("rotation-kid-1").key_type == "RSA"
+        assert rotating_set.find_key("rotation-kid-2").key_type == "EC"

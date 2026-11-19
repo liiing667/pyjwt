@@ -136,6 +136,75 @@ class PyJWK:
         """
         return self._jwk_data.get("use", None)
 
+    @property
+    def is_private_key(self) -> bool:
+        """Whether the JWK carries private key material.
+
+        Asymmetric JWKs (``RSA``, ``EC`` and ``OKP``) expose their private
+        exponent/curve key through the ``d`` member, while symmetric
+        (``oct``) keys are neither public nor private and always report
+        ``False`` here.
+
+        :rtype: bool
+        """
+        if self.key_type == "oct":
+            return False
+        return "d" in self._jwk_data
+
+    @property
+    def has_certificate_chain(self) -> bool:
+        """Whether the JWK embeds an X.509 certificate chain in ``x5c``.
+
+        :rtype: bool
+        """
+        x5c = self._jwk_data.get("x5c")
+        return isinstance(x5c, list) and len(x5c) > 0
+
+    def matches(
+        self,
+        key_id: str,
+        algorithm: str | None = None,
+        key_type: str | None = None,
+        intended_use: str | None = None,
+        allow_private: bool = False,
+    ) -> bool:
+        """Check whether this key satisfies every supplied selector.
+
+        Every supplied criterion must match; criteria left as ``None`` are
+        not evaluated. Matching on ``algorithm`` also requires the key type
+        (``kty``) supported by that algorithm, so a key can never be
+        selected solely because its ``kid`` collides with another member.
+
+        :param key_id: The required ``kid``.
+        :param algorithm: The required algorithm name (e.g. ``"RS256"``).
+        :param key_type: The required ``kty`` (e.g. ``"RSA"``).
+        :param intended_use: The required ``use``; ``"sig"`` additionally
+            accepts keys that do not declare a ``use``.
+        :param allow_private: Whether asymmetric keys containing private
+            material (``d``) are eligible.
+        :rtype: bool
+        """
+        if self.key_id != key_id:
+            return False
+
+        if algorithm is not None and self.algorithm_name != algorithm:
+            return False
+
+        if key_type is not None and self.key_type != key_type:
+            return False
+
+        if intended_use is not None:
+            if intended_use == "sig":
+                if self.public_key_use not in ("sig", None):
+                    return False
+            elif self.public_key_use != intended_use:
+                return False
+
+        if not allow_private and self.is_private_key:
+            return False
+
+        return True
+
 
 class PyJWKSet:
     def __init__(self, keys: list[JWKDict]) -> None:
@@ -175,10 +244,59 @@ class PyJWKSet:
         return PyJWKSet.from_dict(obj)
 
     def __getitem__(self, kid: str) -> PyJWK:
-        for key in self.keys:
-            if key.key_id == kid:
-                return key
-        raise KeyError(f"keyset has no key for kid: {kid}")
+        return self.find_key(kid)
+
+    def find_key(
+        self,
+        kid: str,
+        algorithm: str | None = None,
+        key_type: str | None = None,
+        intended_use: str | None = None,
+        allow_private: bool = False,
+    ) -> PyJWK:
+        """Return the unique set member matching every supplied selector.
+
+        Selection is driven by the set membership (a key must actually be
+        part of this set), its ``kid``, key type (``kty``), algorithm and
+        intended use (``use``) together. When more than one member still
+        matches, the request is ambiguous and fails closed instead of
+        silently picking the first one, which lets callers cache the
+        result without risking that an unrelated key sharing the same
+        ``kid`` (a private key, a certificate-backed copy or a key for
+        another algorithm) is returned.
+
+        :param kid: The required ``kid``.
+        :param algorithm: Optional required algorithm name.
+        :param key_type: Optional required ``kty``.
+        :param intended_use: Optional required ``use``; ``"sig"`` also
+            accepts keys without an explicit ``use``.
+        :param allow_private: Whether asymmetric private keys are eligible.
+        :rtype: PyJWK
+        :raises KeyError: If no member matches the selectors.
+        :raises PyJWKSetError: If more than one member matches.
+        """
+        matches = [
+            key
+            for key in self.keys
+            if key.matches(
+                kid,
+                algorithm=algorithm,
+                key_type=key_type,
+                intended_use=intended_use,
+                allow_private=allow_private,
+            )
+        ]
+
+        if not matches:
+            raise KeyError(f"keyset has no key for kid: {kid}")
+
+        if len(matches) > 1:
+            raise PyJWKSetError(
+                f"keyset has {len(matches)} ambiguous keys for kid: {kid}; "
+                "narrow the selection with the algorithm, key type or use"
+            )
+
+        return matches[0]
 
     def __iter__(self) -> Iterator[PyJWK]:
         return iter(self.keys)

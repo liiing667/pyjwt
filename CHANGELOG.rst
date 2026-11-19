@@ -7,6 +7,19 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 `Unreleased <https://github.com/jpadilla/pyjwt/compare/2.15.1...HEAD>`__
 -------------------------------------------------------------------------
 
+Fixed
+~~~~~
+
+- JWK Set lookups (``PyJWKSet.find_key()`` and ``PyJWKSet[key]``) and
+  ``PyJWKClient.get_signing_key()`` now select a key from the combined
+  ``kid``, key type (``kty``), algorithm and intended use (``use``),
+  instead of returning the first set member whose ``kid`` matches.
+  Requests that still match several keys fail closed with
+  ``PyJWKSetError`` / ``PyJWKClientError`` rather than silently using an
+  unrelated private key, certificate-backed copy or key for another
+  algorithm, so JWK Set caching and legitimate rotation stay
+  unambiguous.
+
 Changed
 ~~~~~~~
 

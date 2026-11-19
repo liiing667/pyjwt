@@ -27,7 +27,7 @@ from jwt.exceptions import (
 )
 from jwt.jwk_set_cache import JWKSetCache
 
-from .utils import crypto_required
+from .utils import crypto_required, key_path
 
 RESPONSE_DATA_WITH_MATCHING_KID = {
     "keys": [
@@ -809,3 +809,175 @@ class TestPyJWKClient:
                 jwks_client.get_jwk_set()
 
             assert http_error.closed
+
+
+def _load_client_jwk(name: str) -> dict[str, Any]:
+    with open(key_path(name)) as keyfile:
+        return json.loads(keyfile.read())
+
+
+@pytest.fixture(scope="module")
+def ambiguous_kid_payload() -> dict[str, Any]:
+    shared_kid = "shared-kid"
+
+    rsa_public = copy.deepcopy(_load_client_jwk("jwk_rsa_pub.json"))
+    rsa_public.update(kid=shared_kid, use="sig", alg="RS256")
+
+    rsa_private = copy.deepcopy(_load_client_jwk("jwk_rsa_key.json"))
+    rsa_private.update(kid=shared_kid, use="sig", alg="RS256")
+
+    ec_public = copy.deepcopy(_load_client_jwk("jwk_ec_pub_P-256.json"))
+    ec_public.update(kid=shared_kid, use="sig")
+
+    hmac_key = copy.deepcopy(_load_client_jwk("jwk_hmac.json"))
+    hmac_key["kid"] = shared_kid
+
+    return {
+        "kid": shared_kid,
+        "keys": [rsa_public, rsa_private, ec_public, hmac_key],
+        "rsa_public": rsa_public,
+        "rsa_private": rsa_private,
+        "ec_public": ec_public,
+        "hmac_key": hmac_key,
+    }
+
+
+@crypto_required
+class TestPyJWKClientAmbiguousKid:
+    """The client must not let a shared ``kid`` pin the wrong cached key."""
+
+    def test_private_key_is_never_a_signing_key(
+        self, ambiguous_kid_payload: dict[str, Any]
+    ) -> None:
+        kid = ambiguous_kid_payload["kid"]
+        with mocked_success_response(ambiguous_kid_payload):
+            client = PyJWKClient("https://issuer.test/jwks")
+            signing_key = client.get_signing_key(kid, algorithm="RS256")
+
+        assert signing_key.key_type == "RSA"
+        assert signing_key.is_private_key is False
+
+    def test_algorithm_disambiguates_same_kid(
+        self, ambiguous_kid_payload: dict[str, Any]
+    ) -> None:
+        kid = ambiguous_kid_payload["kid"]
+        with mocked_success_response(ambiguous_kid_payload):
+            client = PyJWKClient("https://issuer.test/jwks")
+
+            assert client.get_signing_key(kid, "RS256").key_type == "RSA"
+            assert client.get_signing_key(kid, "ES256").key_type == "EC"
+            assert client.get_signing_key(kid, "HS256").key_type == "oct"
+
+    def test_unknown_algorithm_fails_closed(
+        self, ambiguous_kid_payload: dict[str, Any]
+    ) -> None:
+        kid = ambiguous_kid_payload["kid"]
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock()
+            response.read.return_value = json.dumps(ambiguous_kid_payload)
+            opener.open.return_value = response
+
+            client = PyJWKClient("https://issuer.test/jwks", cache_jwk_set=False)
+            with pytest.raises(PyJWKClientError, match="matches"):
+                client.get_signing_key(kid, "ES384")
+
+            # No algorithm matches either before or after the forced refresh.
+            assert opener.open.call_count == 2
+
+    def test_ambiguous_lookup_without_algorithm_fails_closed(
+        self, ambiguous_kid_payload: dict[str, Any]
+    ) -> None:
+        kid = ambiguous_kid_payload["kid"]
+        with mocked_success_response(ambiguous_kid_payload):
+            client = PyJWKClient("https://issuer.test/jwks")
+            with pytest.raises(PyJWKClientError, match="ambiguous"):
+                client.get_signing_key(kid)
+
+    def test_lru_cache_keeps_algorithms_isolated(
+        self, ambiguous_kid_payload: dict[str, Any]
+    ) -> None:
+        kid = ambiguous_kid_payload["kid"]
+        with mocked_success_response(ambiguous_kid_payload):
+            client = PyJWKClient("https://issuer.test/jwks", cache_keys=True)
+
+            rsa_key = client.get_signing_key(kid, "RS256")
+            ec_key = client.get_signing_key(kid, "ES256")
+            hmac_key = client.get_signing_key(kid, "HS256")
+
+        assert rsa_key is not ec_key
+        assert {key.key_type for key in (rsa_key, ec_key, hmac_key)} == {
+            "RSA",
+            "EC",
+            "oct",
+        }
+        # Repeated calls hit the per-(kid, algorithm) cache, not a kid-only slot.
+        with mocked_success_response(ambiguous_kid_payload) as request:
+            assert client.get_signing_key(kid, "RS256") is rsa_key
+            assert client.get_signing_key(kid, "ES256") is ec_key
+        assert request.call_count == 0
+
+    def test_private_only_set_has_no_signing_keys(
+        self, ambiguous_kid_payload: dict[str, Any]
+    ) -> None:
+        payload = {"keys": [ambiguous_kid_payload["rsa_private"]]}
+        with mocked_success_response(payload):
+            client = PyJWKClient("https://issuer.test/jwks")
+            with pytest.raises(PyJWKClientError, match="signing keys"):
+                client.get_signing_key(ambiguous_kid_payload["kid"], "RS256")
+
+    def test_match_kid_still_returns_none_for_unknown_kid(
+        self, ambiguous_kid_payload: dict[str, Any]
+    ) -> None:
+        signing_keys = PyJWKClient._get_signing_keys_from_jwk_set(
+            PyJWKSet.from_dict({"keys": ambiguous_kid_payload["keys"]})
+        )
+        assert PyJWKClient.match_kid(signing_keys, "missing-kid") is None
+        assert PyJWKClient.match_kid(signing_keys, "missing-kid", "RS256") is None
+
+    def test_get_signing_key_from_jwt_uses_header_algorithm(
+        self, ambiguous_kid_payload: dict[str, Any]
+    ) -> None:
+        kid = ambiguous_kid_payload["kid"]
+        private_pem = jwt.algorithms.RSAAlgorithm(
+            jwt.algorithms.RSAAlgorithm.SHA256
+        ).from_jwk(json.dumps(ambiguous_kid_payload["rsa_private"]))
+        token = jwt.encode(
+            {"sub": "ambiguous"},
+            private_pem,
+            algorithm="RS256",
+            headers={"kid": kid},
+        )
+
+        with mocked_success_response(ambiguous_kid_payload):
+            client = PyJWKClient("https://issuer.test/jwks")
+            signing_key = client.get_signing_key_from_jwt(token)
+
+        assert signing_key.key_type == "RSA"
+        jwt.decode(token, signing_key.key, algorithms=["RS256"])
+
+    def test_legitimate_rotation_keeps_working_after_refresh(self) -> None:
+        first = copy.deepcopy(_load_client_jwk("jwk_rsa_pub.json"))
+        first.update(kid="rotation-kid-1", use="sig", alg="RS256")
+        second = copy.deepcopy(_load_client_jwk("jwk_ec_pub_P-256.json"))
+        second.update(kid="rotation-kid-2", use="sig")
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock()
+            response.read.side_effect = [
+                json.dumps({"keys": [first]}),
+                json.dumps({"keys": [first, second]}),
+            ]
+            opener.open.return_value = response
+
+            client = PyJWKClient("https://issuer.test/jwks", cooldown_duration=0)
+            assert client.get_signing_key("rotation-kid-1", "RS256").key_type == "RSA"
+            assert client.get_signing_key("rotation-kid-2", "ES256").key_type == "EC"
+        assert opener.open.call_count == 2

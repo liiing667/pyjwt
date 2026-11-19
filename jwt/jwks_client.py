@@ -14,7 +14,11 @@ from urllib.parse import urlparse
 
 from .api_jwk import PyJWK, PyJWKSet
 from .api_jwt import decode_complete as decode_token
-from .exceptions import PyJWKClientConnectionError, PyJWKClientError
+from .exceptions import (
+    PyJWKClientConnectionError,
+    PyJWKClientError,
+    PyJWKError,
+)
 from .jwk_set_cache import JWKSetCache
 
 
@@ -235,7 +239,9 @@ class PyJWKClient:
         """Return all signing keys from the JWK Set.
 
         Filters the JWK Set to keys whose ``use`` is ``"sig"`` (or
-        unspecified) and that have a ``kid``.
+        unspecified), that have a ``kid`` and that do not embed private
+        key material, since a JWKS endpoint is expected to publish the
+        public verification keys only.
 
         :param refresh: Force a fresh fetch from the endpoint, bypassing
             the cache.
@@ -252,7 +258,9 @@ class PyJWKClient:
         signing_keys = [
             jwk_set_key
             for jwk_set_key in jwk_set.keys
-            if jwk_set_key.public_key_use in ["sig", None] and jwk_set_key.key_id
+            if jwk_set_key.public_key_use in ["sig", None]
+            and jwk_set_key.key_id
+            and not jwk_set_key.is_private_key
         ]
 
         if not signing_keys:
@@ -260,15 +268,21 @@ class PyJWKClient:
 
         return signing_keys
 
-    def get_signing_key(self, kid: str) -> PyJWK:
+    def get_signing_key(self, kid: str, algorithm: str | None = None) -> PyJWK:
         """Return the signing key matching the given ``kid``.
 
-        If no match is found in the current JWK Set, the set is refreshed
-        from the endpoint and the lookup is retried once when the refresh
-        cooldown permits it.
+        Selection considers the ``kid`` together with the requested
+        ``algorithm`` (and, through it, the key type): a key is only
+        returned when it uniquely matches. If no match is found in the
+        current JWK Set, the set is refreshed from the endpoint and the
+        lookup is retried once when the refresh cooldown permits it.
 
         :param kid: The key ID to look up.
         :type kid: str
+        :param algorithm: The JWT signing algorithm (``alg`` header) the
+            key must support. When given, keys bound to another algorithm
+            are rejected even when they share the same ``kid``.
+        :type algorithm: str or None
         :returns: The matching signing key.
         :rtype: PyJWK
         :raises PyJWKClientError: If no matching key is found after
@@ -276,7 +290,10 @@ class PyJWKClient:
         """
         with self._client_lock:
             signing_keys = self.get_signing_keys()
-            signing_key = self.match_kid(signing_keys, kid)
+            try:
+                signing_key = self.match_kid(signing_keys, kid, algorithm=algorithm)
+            except PyJWKError as error:
+                raise PyJWKClientError(str(error)) from error
 
             if not signing_key:
                 cooling_down = (
@@ -288,7 +305,12 @@ class PyJWKClient:
                 if not cooling_down:
                     signing_keys = self.get_signing_keys(refresh=True)
                     self._last_successful_fetch = time.monotonic()
-                    signing_key = self.match_kid(signing_keys, kid)
+                    try:
+                        signing_key = self.match_kid(
+                            signing_keys, kid, algorithm=algorithm
+                        )
+                    except PyJWKError as error:
+                        raise PyJWKClientError(str(error)) from error
 
                 if not signing_key:
                     raise PyJWKClientError(
@@ -310,24 +332,48 @@ class PyJWKClient:
         """
         unverified = decode_token(token, options={"verify_signature": False})
         header = unverified["header"]
-        return self.get_signing_key(header.get("kid"))
+        return self.get_signing_key(header.get("kid"), algorithm=header.get("alg"))
 
     @staticmethod
-    def match_kid(signing_keys: list[PyJWK], kid: str) -> PyJWK | None:
-        """Find a key in *signing_keys* that matches *kid*.
+    def match_kid(
+        signing_keys: list[PyJWK],
+        kid: str,
+        algorithm: str | None = None,
+    ) -> PyJWK | None:
+        """Find the unique key in *signing_keys* that matches *kid*.
+
+        The ``kid`` alone is not treated as a unique identifier. When
+        *algorithm* is given, keys advertised for another algorithm (and
+        therefore another key type) are ignored. If several keys still
+        match, the lookup is ambiguous and fails closed with
+        :class:`PyJWKClientError` rather than returning an arbitrary
+        member, which keeps both iteration order and the LRU key cache
+        from pinning the wrong key.
 
         :param signing_keys: The list of keys to search.
         :type signing_keys: list[PyJWK]
         :param kid: The key ID to match.
         :type kid: str
+        :param algorithm: The required signing algorithm.
+        :type algorithm: str or None
         :returns: The matching key, or ``None`` if not found.
         :rtype: PyJWK or None
+        :raises PyJWKClientError: If more than one key matches.
         """
-        signing_key = None
+        matches = [
+            key
+            for key in signing_keys
+            if key.matches(kid, algorithm=algorithm, intended_use="sig")
+        ]
 
-        for key in signing_keys:
-            if key.key_id == kid:
-                signing_key = key
-                break
+        if not matches:
+            return None
 
-        return signing_key
+        if len(matches) > 1:
+            description = f' and algorithm "{algorithm}"' if algorithm else ""
+            raise PyJWKClientError(
+                f'Multiple signing keys match "{kid}"{description}; '
+                "the JWK Set is ambiguous"
+            )
+
+        return matches[0]
