@@ -93,7 +93,24 @@ class PyJWKSetError(PyJWTError):
     pass
 
 
+class PyJWKSetAmbiguousKeyError(PyJWKSetError):
+    """Raised when a JWK Set lookup by ``kid`` (and optionally key type,
+    algorithm and intended use) matches more than one distinguishable key.
+
+    The set does not identify a single key, so the selection fails closed
+    instead of silently returning the first member."""
+
+    pass
+
+
 class PyJWKClientError(PyJWTError):
+    pass
+
+
+class PyJWKClientAmbiguousKeyError(PyJWKClientError):
+    """Raised when the signing keys offered by a JWKS endpoint do not
+    resolve to a single key for a token's ``kid``, algorithm and key use."""
+
     pass
 
 

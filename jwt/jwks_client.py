@@ -12,9 +12,13 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 
-from .api_jwk import PyJWK, PyJWKSet
+from .api_jwk import PyJWK, PyJWKSet, has_distinct_members, select_keys
 from .api_jwt import decode_complete as decode_token
-from .exceptions import PyJWKClientConnectionError, PyJWKClientError
+from .exceptions import (
+    PyJWKClientAmbiguousKeyError,
+    PyJWKClientConnectionError,
+    PyJWKClientError,
+)
 from .jwk_set_cache import JWKSetCache
 
 
@@ -252,7 +256,12 @@ class PyJWKClient:
         signing_keys = [
             jwk_set_key
             for jwk_set_key in jwk_set.keys
-            if jwk_set_key.public_key_use in ["sig", None] and jwk_set_key.key_id
+            if jwk_set_key.public_key_use in ["sig", None]
+            and jwk_set_key.key_id
+            # A JWKS endpoint publishes verification material. An
+            # asymmetric private key sharing a kid with a public key must
+            # never be the member selected for token verification.
+            and not jwk_set_key.has_private_key
         ]
 
         if not signing_keys:
@@ -260,8 +269,16 @@ class PyJWKClient:
 
         return signing_keys
 
-    def get_signing_key(self, kid: str) -> PyJWK:
+    def get_signing_key(self, kid: str, algorithm: str | None = None) -> PyJWK:
         """Return the signing key matching the given ``kid``.
+
+        The key is selected jointly from its set membership, key type
+        (``kty``), algorithm and intended use (``use``), never from its
+        position in the JWK Set. When *algorithm* is given, keys from a
+        different key family or with a conflicting explicit ``alg`` member
+        are rejected. If the constraints still match more than one
+        distinguishable key, the call fails closed with
+        :class:`PyJWKClientAmbiguousKeyError`.
 
         If no match is found in the current JWK Set, the set is refreshed
         from the endpoint and the lookup is retried once when the refresh
@@ -269,16 +286,22 @@ class PyJWKClient:
 
         :param kid: The key ID to look up.
         :type kid: str
+        :param algorithm: The JWS algorithm the key must support, e.g. the
+            token header's ``alg``. When omitted, selection falls back to
+            the ``kid`` and key use only.
+        :type algorithm: str or None
         :returns: The matching signing key.
         :rtype: PyJWK
         :raises PyJWKClientError: If no matching key is found after
             refreshing.
+        :raises PyJWKClientAmbiguousKeyError: If multiple distinguishable
+            keys match the request.
         """
         with self._client_lock:
             signing_keys = self.get_signing_keys()
-            signing_key = self.match_kid(signing_keys, kid)
+            signing_key = self._match_unique_signing_key(signing_keys, kid, algorithm)
 
-            if not signing_key:
+            if signing_key is None:
                 cooling_down = (
                     self.jwk_set_cache is not None
                     and self._last_successful_fetch is not None
@@ -288,20 +311,54 @@ class PyJWKClient:
                 if not cooling_down:
                     signing_keys = self.get_signing_keys(refresh=True)
                     self._last_successful_fetch = time.monotonic()
-                    signing_key = self.match_kid(signing_keys, kid)
+                    signing_key = self._match_unique_signing_key(
+                        signing_keys, kid, algorithm
+                    )
 
-                if not signing_key:
+                if signing_key is None:
                     raise PyJWKClientError(
                         f'Unable to find a signing key that matches: "{kid}"'
                     )
 
             return signing_key
 
+    @staticmethod
+    def _match_unique_signing_key(
+        signing_keys: list[PyJWK],
+        kid: str,
+        algorithm: str | None,
+    ) -> PyJWK | None:
+        """Return the unique signing key for *kid* or fail closed.
+
+        Raises :class:`PyJWKClientAmbiguousKeyError` when several
+        distinguishable keys match; returns ``None`` when nothing matches.
+        """
+        matches = select_keys(
+            signing_keys,
+            kid,
+            algorithm=algorithm,
+            use="sig",
+            verification_key=True,
+        )
+
+        if not matches:
+            return None
+
+        if has_distinct_members(matches):
+            raise PyJWKClientAmbiguousKeyError(
+                f'Multiple signing keys match: "{kid}"'
+                + (f' and algorithm "{algorithm}"' if algorithm else "")
+            )
+
+        return matches[0]
+
     def get_signing_key_from_jwt(self, token: str | bytes) -> PyJWK:
         """Return the signing key for a JWT by reading its ``kid`` header.
 
-        Extracts the ``kid`` from the token's unverified header and
-        delegates to :meth:`get_signing_key`.
+        Extracts the ``kid`` and ``alg`` from the token's unverified
+        header and delegates to :meth:`get_signing_key`, so the token's
+        declared algorithm participates in the key selection instead of
+        leaving two same-``kid`` keys to be picked by set order.
 
         :param token: The encoded JWT.
         :type token: str or bytes
@@ -310,24 +367,30 @@ class PyJWKClient:
         """
         unverified = decode_token(token, options={"verify_signature": False})
         header = unverified["header"]
-        return self.get_signing_key(header.get("kid"))
+        return self.get_signing_key(header.get("kid"), algorithm=header.get("alg"))
 
     @staticmethod
-    def match_kid(signing_keys: list[PyJWK], kid: str) -> PyJWK | None:
-        """Find a key in *signing_keys* that matches *kid*.
+    def match_kid(
+        signing_keys: list[PyJWK],
+        kid: str,
+        algorithm: str | None = None,
+    ) -> PyJWK | None:
+        """Find the unique key in *signing_keys* matching *kid*.
+
+        Membership, key type, algorithm and use decide the match together.
+        Returns the matching :class:`PyJWK` or ``None`` when nothing
+        matches. When several distinguishable keys match, fails closed with
+        :class:`PyJWKClientAmbiguousKeyError` rather than guessing.
 
         :param signing_keys: The list of keys to search.
         :type signing_keys: list[PyJWK]
         :param kid: The key ID to match.
         :type kid: str
+        :param algorithm: The JWS algorithm the key must support.
+        :type algorithm: str or None
         :returns: The matching key, or ``None`` if not found.
         :rtype: PyJWK or None
+        :raises PyJWKClientAmbiguousKeyError: If multiple distinguishable
+            keys match.
         """
-        signing_key = None
-
-        for key in signing_keys:
-            if key.key_id == kid:
-                signing_key = key
-                break
-
-        return signing_key
+        return PyJWKClient._match_unique_signing_key(signing_keys, kid, algorithm)

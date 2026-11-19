@@ -514,6 +514,20 @@ If the ``kid`` is not found in the current key set, ``PyJWKClient``
 automatically refreshes the JWKS from the endpoint and retries before raising
 an error.
 
+Key selection is not based on the order the keys appear in the JWKS. When
+several members share a ``kid``, the member's key type (``kty``), the
+token's ``alg`` (matched against the key family and any explicit ``alg``
+member), its intended use (``use``) and its material (symmetric secret,
+asymmetric private key, plain public key or certificate-backed key) decide
+the match together. Asymmetric private keys are never handed out for
+signature verification, and if more than one distinguishable key still
+matches, the lookup fails closed with
+``jwt.PyJWKClientAmbiguousKeyError`` rather than guessing. Unique ``kid``
+values used during key rotation and byte-identical duplicate members keep
+resolving normally. For direct access to a parsed key set,
+``PyJWKSet.get_key(kid, algorithm=..., use=...)`` offers the same
+ambiguity-aware selection and raises ``jwt.PyJWKSetAmbiguousKeyError``.
+
 ``PyJWKClient`` also includes built-in caching to avoid unnecessary network
 requests. See :class:`~jwt.PyJWKClient` in the API reference for details on
 the caching parameters.

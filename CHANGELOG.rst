@@ -14,6 +14,34 @@ Changed
   ES256 tokens, including rejection of tampered payloads and signatures,
   in `#1211 <https://github.com/jpadilla/pyjwt/pull/1211>`__.
 
+Fixed
+~~~~~
+
+- JWK Set lookups no longer select a same-``kid`` member by its position
+  in the set. ``PyJWKSet.get_key()`` and ``PyJWKClient.get_signing_key()``
+  now decide jointly from set membership, key type (``kty``), algorithm
+  (the token's ``alg`` and a JWK's explicit ``alg`` member), intended use
+  (``use``) and key material (symmetric, asymmetric private, plain public
+  or certificate-backed). Asymmetric private keys are never returned for
+  signature verification, and multiple distinguishable matches fail closed
+  with the new ``jwt.PyJWKSetAmbiguousKeyError`` /
+  ``jwt.PyJWKClientAmbiguousKeyError`` instead of silently returning the
+  first member. Legitimate rotation keeps working: unique ``kid`` values
+  and byte-identical duplicate members resolve normally.
+
+Added
+~~~~~
+
+- ``PyJWKSet.get_key(kid, algorithm=None, use=None, verification_key=True)``
+  for ambiguity-aware key selection.
+- ``PyJWK.has_private_key``, ``PyJWK.is_symmetric``,
+  ``PyJWK.has_certificate`` and ``PyJWK.key_material`` to expose the
+  material a JWK represents.
+- ``PyJWKClient.get_signing_key()`` accepts an optional ``algorithm`` and
+  ``get_signing_key_from_jwt()`` passes the token header's ``alg`` into
+  the selection, so the per-key LRU cache distinguishes same-``kid`` keys
+  for different algorithms.
+
 `v2.15.1 <https://github.com/jpadilla/pyjwt/compare/2.15.0...2.15.1>`__
 -----------------------------------------------------------------------
 

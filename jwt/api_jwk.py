@@ -10,10 +10,39 @@ from .exceptions import (
     InvalidKeyError,
     MissingCryptographyError,
     PyJWKError,
+    PyJWKSetAmbiguousKeyError,
     PyJWKSetError,
     PyJWTError,
 )
 from .types import JWKDict
+
+#: Maps every supported JWS algorithm to the key type (``kty``) it uses,
+#: so an algorithm-aware lookup can reject a key whose family cannot
+#: perform the requested algorithm even when the JWK omits ``alg``.
+_ALGORITHM_KEY_TYPES: dict[str, str] = {
+    "HS256": "oct",
+    "HS384": "oct",
+    "HS512": "oct",
+    "RS256": "RSA",
+    "RS384": "RSA",
+    "RS512": "RSA",
+    "PS256": "RSA",
+    "PS384": "RSA",
+    "PS512": "RSA",
+    "ES256": "EC",
+    "ES256K": "EC",
+    "ES384": "EC",
+    "ES512": "EC",
+    "ES521": "EC",
+    "EdDSA": "OKP",
+}
+
+#: JWK members that mark an asymmetric key as carrying private material.
+#: ``oct`` keys are symmetric secrets and stay usable for verification.
+_PRIVATE_KEY_MEMBERS = frozenset(("d",))
+
+#: JWK members that carry certificate material.
+_CERTIFICATE_MEMBERS = frozenset(("x5c", "x5t", "x5t#S256"))
 
 
 class PyJWK:
@@ -136,6 +165,60 @@ class PyJWK:
         """
         return self._jwk_data.get("use", None)
 
+    @property
+    def has_private_key(self) -> bool:
+        """Whether the JWK carries asymmetric private-key material.
+
+        Asymmetric keys with a private member (``d``) can sign but must
+        never be picked for signature verification against another key's
+        ``kid``. Symmetric (``oct``) keys are not considered private here:
+        their secret is both the signing and the verification material.
+
+        :rtype: bool
+        """
+        if self.key_type == "oct":
+            return False
+        return any(member in self._jwk_data for member in _PRIVATE_KEY_MEMBERS)
+
+    @property
+    def is_symmetric(self) -> bool:
+        """Whether the JWK is a symmetric (``oct``) key.
+
+        :rtype: bool
+        """
+        return self.key_type == "oct"
+
+    @property
+    def has_certificate(self) -> bool:
+        """Whether the JWK embeds certificate material (``x5c``/``x5t``).
+
+        A key represented through a certificate chain is a distinct member
+        from a plain public-key JWK, even when both share a ``kid``.
+
+        :rtype: bool
+        """
+        return any(member in self._jwk_data for member in _CERTIFICATE_MEMBERS)
+
+    @property
+    def key_material(self) -> str:
+        """A stable label for the kind of key material the JWK represents.
+
+        One of ``"symmetric"``, ``"private"``, ``"certificate"`` or
+        ``"public"``. Together with :attr:`key_type`,
+        :attr:`algorithm_name` and :attr:`public_key_use` this lets a key
+        set tell same-``kid`` members apart instead of relying on their
+        position in the set.
+
+        :rtype: str
+        """
+        if self.is_symmetric:
+            return "symmetric"
+        if self.has_private_key:
+            return "private"
+        if self.has_certificate:
+            return "certificate"
+        return "public"
+
 
 class PyJWKSet:
     def __init__(self, keys: list[JWKDict]) -> None:
@@ -175,13 +258,137 @@ class PyJWKSet:
         return PyJWKSet.from_dict(obj)
 
     def __getitem__(self, kid: str) -> PyJWK:
-        for key in self.keys:
-            if key.key_id == kid:
-                return key
-        raise KeyError(f"keyset has no key for kid: {kid}")
+        try:
+            return self.get_key(kid)
+        except PyJWKSetAmbiguousKeyError as error:
+            # Keep the mapping protocol: an ambiguous or missing kid is a
+            # KeyError for __getitem__ callers, while the explicit
+            # get_key() API surfaces the ambiguity reason.
+            raise KeyError(str(error)) from error
 
     def __iter__(self) -> Iterator[PyJWK]:
         return iter(self.keys)
+
+    def get_key(
+        self,
+        kid: str,
+        algorithm: str | None = None,
+        use: str | None = None,
+        verification_key: bool = True,
+    ) -> PyJWK:
+        """Return the single key matching *kid* and the other constraints.
+
+        Selection is driven by every dimension that distinguishes set
+        members, rather than the order they appear in:
+
+        - ``kid`` must match;
+        - *algorithm* (the JWS ``alg`` of the token being verified, if
+          known) must be compatible with the key's family and with an
+          explicit ``alg`` member;
+        - *use* must be compatible with the key's ``use`` member;
+        - when *verification_key* is true, asymmetric private keys are
+          excluded so a signing key can never be returned where only a
+          verification key is safe.
+
+        If the constraints still match more than one distinguishable key,
+        the lookup fails closed with :class:`PyJWKSetAmbiguousKeyError`
+        instead of returning whichever member happens to come first.
+
+        :param kid: The key ID to match.
+        :type kid: str
+        :param algorithm: The JWS algorithm the key must support.
+        :type algorithm: str or None
+        :param use: The intended public key use (e.g. ``"sig"``).
+        :type use: str or None
+        :param verification_key: Reject asymmetric private keys when true.
+        :type verification_key: bool
+        :rtype: PyJWK
+        :raises PyJWKSetAmbiguousKeyError: If zero or multiple keys match.
+        """
+        matches = select_keys(
+            self.keys,
+            kid,
+            algorithm=algorithm,
+            use=use,
+            verification_key=verification_key,
+        )
+
+        if not matches:
+            raise PyJWKSetAmbiguousKeyError(
+                f"keyset has no key for kid: {kid!r}, algorithm: "
+                f"{algorithm!r}, use: {use!r}"
+            )
+
+        fingerprints = _member_fingerprints(matches)
+        if len(fingerprints) > 1:
+            raise PyJWKSetAmbiguousKeyError(
+                f"kid {kid!r} is not unique in the JWK Set: "
+                f"{len(fingerprints)} distinguishable keys match "
+                f"algorithm {algorithm!r} and use {use!r}"
+            )
+
+        return matches[0]
+
+
+def select_keys(
+    keys: list[PyJWK],
+    kid: str,
+    algorithm: str | None = None,
+    use: str | None = None,
+    verification_key: bool = True,
+) -> list[PyJWK]:
+    """Filter *keys* to the members compatible with a key-selection request.
+
+    See :meth:`PyJWKSet.get_key` for the meaning of each constraint. Every
+    constraint narrows the candidates; nothing here guesses between keys.
+    """
+    expected_kty = _ALGORITHM_KEY_TYPES.get(algorithm) if algorithm else None
+
+    matches: list[PyJWK] = []
+    for key in keys:
+        if key.key_id != kid:
+            continue
+
+        if verification_key and key.has_private_key:
+            # An asymmetric private key can sign but must not be handed to
+            # a verifier, even when it shares the requested kid.
+            continue
+
+        if use is not None and key.public_key_use not in (use, None):
+            continue
+
+        if expected_kty is not None and key.key_type != expected_kty:
+            continue
+
+        if algorithm is not None:
+            declared = key._jwk_data.get("alg")
+            if declared is not None and declared != algorithm:
+                continue
+
+        matches.append(key)
+
+    return matches
+
+
+def _member_fingerprints(keys: list[PyJWK]) -> set[str]:
+    """Canonical fingerprints of the JWK payloads in *keys*.
+
+    Member order is ignored, so a repeated copy of the same JWK produces a
+    single fingerprint instead of looking like a second identity.
+    """
+    return {
+        json.dumps(key._jwk_data, sort_keys=True, separators=(",", ":")) for key in keys
+    }
+
+
+def has_distinct_members(keys: list[PyJWK]) -> bool:
+    """Whether *keys* hold more than one distinguishable JWK identity.
+
+    Repeated copies of the same JWK (common while a rotation window keeps
+    old and new documents overlapping) are not ambiguity, but keys whose
+    members differ are distinct identities and must fail closed.
+    """
+    return len(_member_fingerprints(keys)) > 1
 
 
 class PyJWTSetWithTimestamp:

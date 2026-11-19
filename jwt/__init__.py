@@ -19,9 +19,11 @@ from .exceptions import (
     InvalidSignatureError,
     InvalidTokenError,
     MissingRequiredClaimError,
+    PyJWKClientAmbiguousKeyError,
     PyJWKClientConnectionError,
     PyJWKClientError,
     PyJWKError,
+    PyJWKSetAmbiguousKeyError,
     PyJWKSetError,
     PyJWTError,
 )
@@ -70,9 +72,11 @@ __all__ = [
     "InvalidSignatureError",
     "InvalidTokenError",
     "MissingRequiredClaimError",
+    "PyJWKClientAmbiguousKeyError",
     "PyJWKClientConnectionError",
     "PyJWKClientError",
     "PyJWKError",
+    "PyJWKSetAmbiguousKeyError",
     "PyJWKSetError",
     "PyJWTError",
 ]
