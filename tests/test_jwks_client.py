@@ -255,6 +255,65 @@ class TestPyJWKClient:
 
         assert "The JWKS endpoint did not contain any signing keys" in str(exc.value)
 
+    def test_get_signing_keys_excludes_keys_without_verify_key_op(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+
+        mocked_key = RESPONSE_DATA_WITH_MATCHING_KID["keys"][0].copy()
+        mocked_key["key_ops"] = ["encrypt"]
+        response = {"keys": [mocked_key]}
+        with mocked_success_response(response):
+            jwks_client = PyJWKClient(url)
+
+            with pytest.raises(PyJWKClientError) as exc:
+                jwks_client.get_signing_keys()
+
+        assert "The JWKS endpoint did not contain any signing keys" in str(exc.value)
+
+    def test_get_signing_keys_allows_verify_key_op(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+
+        mocked_key = RESPONSE_DATA_WITH_MATCHING_KID["keys"][0].copy()
+        mocked_key["key_ops"] = ["verify"]
+        response = {"keys": [mocked_key]}
+
+        with mocked_success_response(response):
+            jwks_client = PyJWKClient(url)
+            signing_keys = jwks_client.get_signing_keys()
+
+        assert len(signing_keys) == 1
+        assert isinstance(signing_keys[0], PyJWK)
+
+    def test_get_signing_key_selects_matching_kid_during_rotation(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        kid = "MLYHNMMhwCNXw9roHIILFsK4nLs="
+        response = {
+            "keys": [
+                RESPONSE_DATA_WITH_MATCHING_KID["keys"][0],
+                RESPONSE_DATA_NO_MATCHING_KID["keys"][0],
+            ]
+        }
+
+        with mocked_success_response(response):
+            jwks_client = PyJWKClient(url)
+            signing_key = jwks_client.get_signing_key(kid)
+
+        assert isinstance(signing_key, PyJWK)
+        assert signing_key.key_id == kid
+
+    def test_get_signing_key_fails_closed_on_duplicate_kid(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        mocked_key = RESPONSE_DATA_WITH_MATCHING_KID["keys"][0]
+        response = {"keys": [mocked_key, dict(mocked_key)]}
+
+        with mocked_success_response(response):
+            jwks_client = PyJWKClient(url)
+
+            with pytest.raises(PyJWKClientError) as exc:
+                jwks_client.get_signing_key(kid)
+
+        assert "Multiple signing keys match" in str(exc.value)
+
     def test_get_signing_key(self) -> None:
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
         kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
@@ -325,6 +384,39 @@ class TestPyJWKClient:
             "azp": "aW4Cca79xReLWUz0aE2H6kD0O3cXBVtC",
             "gty": "client-credentials",
         }
+
+    def test_get_signing_key_from_jwt_rejects_conflicting_alg(self) -> None:
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        token = jwt.encode(
+            {"iss": "x"}, "secret", algorithm="HS256", headers={"kid": kid}
+        )
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            jwks_client = PyJWKClient(url)
+
+            with pytest.raises(PyJWKClientError) as exc:
+                jwks_client.get_signing_key_from_jwt(token)
+
+        assert "does not match" in str(exc.value)
+
+    def test_get_signing_key_from_jwt_allows_key_without_alg(self) -> None:
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        token = jwt.encode(
+            {"iss": "x"}, "secret", algorithm="HS256", headers={"kid": kid}
+        )
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+
+        mocked_key = RESPONSE_DATA_WITH_MATCHING_KID["keys"][0].copy()
+        del mocked_key["alg"]
+        response = {"keys": [mocked_key]}
+
+        with mocked_success_response(response):
+            jwks_client = PyJWKClient(url)
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+
+        assert isinstance(signing_key, PyJWK)
+        assert signing_key.key_id == kid
 
     def test_get_signing_key_from_jwt_rejects_payload_recursion_error(self) -> None:
         token = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0.e30."

@@ -235,7 +235,8 @@ class PyJWKClient:
         """Return all signing keys from the JWK Set.
 
         Filters the JWK Set to keys whose ``use`` is ``"sig"`` (or
-        unspecified) and that have a ``kid``.
+        unspecified), whose ``key_ops`` (when present) allow ``"verify"``,
+        and that have a ``kid``.
 
         :param refresh: Force a fresh fetch from the endpoint, bypassing
             the cache.
@@ -252,7 +253,9 @@ class PyJWKClient:
         signing_keys = [
             jwk_set_key
             for jwk_set_key in jwk_set.keys
-            if jwk_set_key.public_key_use in ["sig", None] and jwk_set_key.key_id
+            if jwk_set_key.public_key_use in ["sig", None]
+            and (jwk_set_key.key_ops is None or "verify" in jwk_set_key.key_ops)
+            and jwk_set_key.key_id
         ]
 
         if not signing_keys:
@@ -310,7 +313,20 @@ class PyJWKClient:
         """
         unverified = decode_token(token, options={"verify_signature": False})
         header = unverified["header"]
-        return self.get_signing_key(header.get("kid"))
+        signing_key = self.get_signing_key(header.get("kid"))
+
+        # Fail closed when the token's algorithm contradicts the algorithm
+        # declared by the JWK itself, so a key published for one algorithm
+        # can't be reused to verify a token signed with another.
+        token_alg = header.get("alg")
+        jwk_alg = signing_key._jwk_data.get("alg")
+        if token_alg and jwk_alg and token_alg != jwk_alg:
+            raise PyJWKClientError(
+                f'The token algorithm "{token_alg}" does not match the '
+                f'algorithm "{jwk_alg}" of the signing key "{signing_key.key_id}"'
+            )
+
+        return signing_key
 
     @staticmethod
     def match_kid(signing_keys: list[PyJWK], kid: str) -> PyJWK | None:
@@ -322,12 +338,14 @@ class PyJWKClient:
         :type kid: str
         :returns: The matching key, or ``None`` if not found.
         :rtype: PyJWK or None
+        :raises PyJWKClientError: If more than one key matches *kid*.
         """
         signing_key = None
 
         for key in signing_keys:
             if key.key_id == kid:
+                if signing_key is not None:
+                    raise PyJWKClientError(f'Multiple signing keys match: "{kid}"')
                 signing_key = key
-                break
 
         return signing_key

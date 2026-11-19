@@ -85,6 +85,27 @@ class TestPyJWK:
         assert jwk.algorithm_name == "RS256"
 
     @crypto_required
+    def test_should_reject_algorithm_conflicting_with_jwk_alg(self) -> None:
+        with open(key_path("jwk_rsa_pub.json")) as keyfile:
+            key_data = json.loads(keyfile.read())
+
+        key_data["alg"] = "RS256"
+
+        with pytest.raises(InvalidKeyError):
+            PyJWK.from_dict(key_data, algorithm="RS384")
+
+    @crypto_required
+    def test_should_expose_key_ops(self) -> None:
+        with open(key_path("jwk_rsa_pub.json")) as keyfile:
+            key_data = json.loads(keyfile.read())
+
+        assert PyJWK.from_dict(key_data).key_ops is None
+
+        key_data["key_ops"] = ["verify"]
+
+        assert PyJWK.from_dict(key_data).key_ops == ["verify"]
+
+    @crypto_required
     def test_should_load_key_ec_p256_from_dict(self) -> None:
         with open(key_path("jwk_ec_pub_P-256.json")) as keyfile:
             key_data = json.loads(keyfile.read())
@@ -307,6 +328,25 @@ class TestPyJWKSet:
 
         with pytest.raises(KeyError):
             _ = jwk_set["this-kid-does-not-exist"]
+
+    @crypto_required
+    def test_keyset_getitem_fails_closed_on_duplicate_kid(self) -> None:
+        algo = RSAAlgorithm(RSAAlgorithm.SHA256)
+
+        with open(key_path("jwk_rsa_pub.json")) as keyfile:
+            pub_key = algo.from_jwk(keyfile.read())
+
+        key_data_str = algo.to_jwk(pub_key)
+        key_data = json.loads(key_data_str)
+
+        key_data["alg"] = "RS256"
+        key_data["use"] = "sig"
+        key_data["kid"] = "keyid-abc123"
+
+        jwk_set = PyJWKSet.from_dict({"keys": [key_data, dict(key_data)]})
+
+        with pytest.raises(KeyError):
+            _ = jwk_set["keyid-abc123"]
 
     @crypto_required
     def test_keyset_iterator(self) -> None:

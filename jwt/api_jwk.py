@@ -34,8 +34,15 @@ class PyJWK:
         if not kty:
             raise InvalidKeyError(f"kty is not found: {self._jwk_data}")
 
-        if not algorithm and isinstance(self._jwk_data, dict):
-            algorithm = self._jwk_data.get("alg", None)
+        if isinstance(self._jwk_data, dict):
+            jwk_alg = self._jwk_data.get("alg", None)
+            if jwk_alg:
+                if algorithm and algorithm != jwk_alg:
+                    raise InvalidKeyError(
+                        f"Provided algorithm {algorithm!r} does not match the "
+                        f"JWK alg {jwk_alg!r}"
+                    )
+                algorithm = jwk_alg
 
         if not algorithm:
             # Determine alg with kty (and crv).
@@ -136,6 +143,14 @@ class PyJWK:
         """
         return self._jwk_data.get("use", None)
 
+    @property
+    def key_ops(self) -> list[str] | None:
+        """The `key_ops` property from the JWK.
+
+        :rtype: list[str] or None
+        """
+        return self._jwk_data.get("key_ops", None)
+
 
 class PyJWKSet:
     def __init__(self, keys: list[JWKDict]) -> None:
@@ -175,9 +190,14 @@ class PyJWKSet:
         return PyJWKSet.from_dict(obj)
 
     def __getitem__(self, kid: str) -> PyJWK:
+        match: PyJWK | None = None
         for key in self.keys:
             if key.key_id == kid:
-                return key
+                if match is not None:
+                    raise KeyError(f"keyset has multiple keys for kid: {kid}")
+                match = key
+        if match is not None:
+            return match
         raise KeyError(f"keyset has no key for kid: {kid}")
 
     def __iter__(self) -> Iterator[PyJWK]:
